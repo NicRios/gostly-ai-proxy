@@ -1,0 +1,102 @@
+# Gostly AI — Self-hosted proxy
+#
+# Prerequisites:
+#   1. Sign up at https://gostly.ai and grab your license key + registry token
+#   2. Authenticate with the Gostly registry:
+#        docker login -u AWS -p <your-registry-token> 242201285974.dkr.ecr.us-east-1.amazonaws.com
+#   3. Replace YOUR_LICENSE_KEY below with your key from gostly.ai/dashboard
+#   4. Set BACKEND_URL to the upstream service you want to mock
+#   5. Run: docker compose up
+
+services:
+
+  ghost-postgres:
+    image: postgres:16-alpine
+    container_name: ghost-postgres
+    environment:
+      POSTGRES_USER: ghost
+      POSTGRES_PASSWORD: ghost
+      POSTGRES_DB: ghost
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ghost -d ghost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  ghost-web:
+    image: 242201285974.dkr.ecr.us-east-1.amazonaws.com/gostlyai/web:latest
+    container_name: ghost-web
+    ports:
+      - "3000:3000"
+      - "8000:8000"
+    environment:
+      GOSTLY_LICENSE_KEY: YOUR_LICENSE_KEY
+      GOSTLY_PLATFORM_URL: https://gostly.ai
+      AGENT_URL: http://ghost-proxy:8080
+      INFERENCE_URL: http://ghost-inference:5000
+      API_BASE_URL: http://ghost-web:8000
+      MOCK_DIR: /data/mocks
+      TRAFFIC_LOG_DIR: /data/traffic
+      DATABASE_URL: postgresql://ghost:ghost@ghost-postgres:5432/ghost
+    volumes:
+      - ./data:/data
+    depends_on:
+      ghost-postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  ghost-inference:
+    image: 242201285974.dkr.ecr.us-east-1.amazonaws.com/gostlyai/inference:latest
+    container_name: ghost-inference
+    environment:
+      MOCK_DIR: /data/mocks
+      FAISS_INDEX_PATH: /data/faiss.index
+      FAISS_MAP_PATH: /data/faiss_id_map.json
+      ENABLE_GENERATION: "true"
+      API_BASE_URL: http://ghost-web:8000
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health').read()"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  ghost-proxy:
+    image: 242201285974.dkr.ecr.us-east-1.amazonaws.com/gostlyai/proxy:latest
+    container_name: ghost-proxy
+    ports:
+      - "8080:8080"
+    environment:
+      GOSTLY_LICENSE_KEY: YOUR_LICENSE_KEY
+      BACKEND_URL: http://your-service:3000
+      PROXY_PORT: "8080"
+      MOCK_DIR: /data/mocks
+      SEQUENCE_FILE_PATH: /data/sequences.jsonl
+      MODE_FILE_PATH: /data/mode.txt
+      INFERENCE_URL: http://ghost-inference:5000
+      AI_CONFIDENCE_THRESHOLD: "0.70"
+      API_URL: http://ghost-web:8000
+      TRAFFIC_LOG_DIR: /data/traffic
+    volumes:
+      - ./data:/data
+    depends_on:
+      ghost-web:
+        condition: service_healthy
+      ghost-inference:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
