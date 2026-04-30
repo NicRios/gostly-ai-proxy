@@ -1,6 +1,6 @@
 # Architecture
 
-Gostly is an HTTP proxy that records real API traffic and replays it back to the calling application. This document describes the components, the matching pipeline, the storage model, and how the system is deployed.
+Gostly is a proxy that records real API traffic and replays it back to the calling application. This document describes the components, the matching pipeline, the storage model, and how the system is deployed.
 
 For a five-minute setup, see [README.md](./README.md).
 
@@ -20,10 +20,10 @@ When a request in `MOCK` mode does not match a recorded pair exactly, two furthe
 ┌─────────────────────────────────────────────────────────────────┐
 │                       Calling application                       │
 └─────────────────────────────┬───────────────────────────────────┘
-                              │ HTTP
+                              │ HTTP/HTTPS
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  Caddy (TLS termination, ports 80/443)                          │
+│  Caddy (Optional TLS termination, ports 80/443)                 │
 └──────────┬────────────────────────────┬─────────────────────────┘
            │                            │
            ▼                            ▼
