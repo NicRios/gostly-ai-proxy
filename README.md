@@ -2,6 +2,8 @@
 
 Stop writing mocks. Gostly sits in front of your external API calls, records real traffic, and replays it — so your team can build and test without depending on live services.
 
+Recorded traffic stays on your machine — there's no Gostly cloud reading it.
+
 ## Quickstart
 
 **1. Sign up and get your credentials**
@@ -37,6 +39,8 @@ In **LEARN mode**, Gostly records every request/response pair.
 In **MOCK mode**, Gostly replays recorded responses — no live service needed.
 
 When Gostly doesn't have an exact match, AI fallback generates a plausible response based on learned traffic patterns (Pro/Team).
+
+For a deeper walkthrough of the components, match pipeline, and storage model, see [ARCHITECTURE.md](./ARCHITECTURE.md).
 
 ## Ports
 
