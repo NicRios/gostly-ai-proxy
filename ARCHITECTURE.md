@@ -28,19 +28,19 @@ When a request in `MOCK` mode does not match a recorded pair exactly, two furthe
            │                            │
            ▼                            ▼
 ┌──────────────────┐          ┌──────────────────────┐
-│  Proxy (Rust)    │          │  Dashboard (Next.js) │
+│  Proxy           │          │  Dashboard           │
 │  port 8080       │ ◄──────► │  port 3000           │
 └────────┬─────────┘          └──────────┬───────────┘
          │                               │
          │ control plane                 │ REST
          ▼                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  API (Python / FastAPI) — port 8000                             │
+│  API  — port 8000                                               │
 └──────────┬─────────────────────────────┬────────────────────────┘
            │                             │
            ▼                             ▼
 ┌──────────────────┐          ┌──────────────────────┐
-│  Postgres 16     │          │  Inference (Python)  │
+│  Postgres 16     │          │  Inference           │
 │                  │          │  port 5000           │
 └──────────────────┘          └──────────────────────┘
 
@@ -50,13 +50,13 @@ Shared volume: ./data/
   traffic/{svc}.jsonl     models/adapters/{svc}/{session}/
 ```
 
-| Container   | Language                       | Responsibility                                       |
-|-------------|--------------------------------|------------------------------------------------------|
-| `proxy`     | Rust (Axum + Tokio)            | HTTP capture and replay                              |
-| `api`       | Python (FastAPI + SQLAlchemy)  | Control plane, mock library, training pipeline       |
-| `dashboard` | TypeScript (Next.js 14)        | Operator UI                                          |
-| `inference` | Python (FastAPI + PyTorch)     | AI fallback for unmatched requests                   |
-| `postgres`  | Postgres 16                    | Persistent state (scrubbed mocks, services, sessions)|
+| Container   | Responsibility                                       |
+|-------------|------------------------------------------------------|
+| `proxy`     | HTTP capture and replay                              |
+| `api`       | Control plane, mock library, training pipeline       |
+| `dashboard` | Operator UI                                          |
+| `inference` | AI fallback for unmatched requests                   |
+| `postgres`  | Persistent state (scrubbed mocks, services, sessions)|
 
 All five containers run on the same host. The only outbound network call from the stack is license validation against the configured license server.
 
