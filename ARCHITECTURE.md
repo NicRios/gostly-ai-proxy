@@ -8,9 +8,9 @@ For a five-minute setup, see [README.md](./README.md).
 
 ## Overview
 
-The proxy sits between an application and an upstream HTTP service. In `LEARN` mode it forwards requests upstream and records every request/response pair. In `MOCK` mode it serves recorded responses without reaching the upstream. Two further modes (`HYBRID`, `PASSTHROUGH`) cover mixed and disabled cases.
+The proxy sits between an application and an upstream HTTP service. In `LEARN` mode it forwards requests upstream and records every request/response pair. In `MOCK` mode it serves recorded responses without reaching the upstream. One further mode (`PASSTHROUGH`) forwards without recording.
 
-When a request in `MOCK` or `HYBRID` mode does not match a recorded pair exactly, two further matching layers run before falling through to the upstream (or returning 502 in `MOCK`).
+When a request in `MOCK` mode does not match a recorded pair exactly, two further matching layers run before returning 502.
 
 ---
 
@@ -64,7 +64,7 @@ All five containers run on the same host. The only outbound network call from th
 
 ## Match pipeline
 
-For each incoming request in `MOCK` or `HYBRID` mode, the proxy walks three layers in order. The first layer that produces a confident answer serves the response.
+For each incoming request in `MOCK` mode, the proxy walks three layers in order. The first layer that produces a confident answer serves the response.
 
 ### 1. Exact match
 
@@ -125,7 +125,6 @@ Mode is per-service. Multiple services in a single proxy install can run differe
 |----------------|-----------------------------------------------------------|
 | `LEARN`        | Forward all requests upstream, record every pair          |
 | `MOCK`         | Serve recorded responses, never touch the upstream        |
-| `HYBRID`       | Try mock first, fall through to upstream on no match      |
 | `PASSTHROUGH`  | Forward without recording                                 |
 
 ---
@@ -164,30 +163,3 @@ Recorded `data/` directory is committed (or restored from a CI cache). Proxy sta
 
 One proxy instance per staging environment, multiple applications pointing at it. Mode is per-service, so different teams can run different modes without stepping on each other.
 
-### Air-gapped / private license server
-
-Set `GOSTLY_LICENSE_SERVER_URL` to the private license server and `GOSTLY_JWKS_PATH` to a local JWKS file. The proxy validates the license JWT against the local JWKS without external network access.
-
----
-
-## Source layout
-
-```
-agent/         Rust proxy — request handling, matching, recording
-api/           Python control plane — mock library, patterns, training
-dashboard/     Next.js operator UI
-ai/            Python inference — generation, fine-tuning
-data/          Shared Docker volume — mock_library.jsonl, mode.txt, adapters
-```
-
-### Inter-service contracts
-
-| From       | To         | Transport       | Endpoints                                       |
-|------------|------------|-----------------|-------------------------------------------------|
-| proxy      | api        | HTTP + files    | `/ghost/reload`, `/ghost/mode`, `/patterns`     |
-| dashboard  | api        | HTTP            | REST                                            |
-| proxy      | inference  | HTTP            | `/generate`, `/health`                          |
-| api        | postgres   | TCP             | SQLAlchemy / asyncpg                            |
-| proxy      | api        | files           | `data/mock_*.jsonl`, `data/mode.txt`            |
-
-The shared `./data/` volume is a contract surface: both the proxy and the API write to and read from it. Format changes require coordinated updates on both sides.
