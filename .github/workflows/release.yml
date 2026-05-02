@@ -1,0 +1,254 @@
+name: release
+
+# Triggered by a `v*` tag push (e.g. `git tag v0.1.0 && git push --tags`).
+# Cross-builds the binary for five (OS, arch) tuples, packages each as a
+# tar.gz (Linux/macOS) or zip (Windows), uploads every artifact as a
+# release asset, then builds and pushes a multi-arch Docker image to
+# ghcr.io/nicrios/gostly-proxy:<version> + :latest.
+#
+# Linux uses cross-rs for amd64+arm64 from an Ubuntu x86_64 runner; macOS
+# and Windows build natively. `:latest` updates on every successful
+# tag-triggered release.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (e.g. v0.1.0). Manual dispatch is for dry-runs only — no GHCR push.'
+        required: true
+        default: 'v0.0.0-dryrun'
+
+permissions:
+  contents: write   # upload release assets
+  packages: write   # push to GHCR
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false   # never cancel a release mid-flight
+
+jobs:
+  # ── Native + cross builds for five (OS, arch) tuples ──────────────────────
+  build:
+    name: build ${{ matrix.target.os }}/${{ matrix.target.arch }}
+    runs-on: ${{ matrix.target.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          # Linux: cross-rs handles both amd64 and arm64 from an Ubuntu x86_64
+          # runner. Picking ubuntu-latest (24.04 at time of writing) means a
+          # newer glibc baseline; if we hit "GLIBC_2.38 not found" reports
+          # from users on older distros we'll downshift to ubuntu-22.04 and
+          # rebuild. Document the supported distro floor in the README.
+          - os: linux
+            arch: amd64
+            runner: ubuntu-latest
+            triple: x86_64-unknown-linux-gnu
+            use_cross: true
+            archive: tar.gz
+            bin: gostly-proxy
+          - os: linux
+            arch: arm64
+            runner: ubuntu-latest
+            triple: aarch64-unknown-linux-gnu
+            use_cross: true
+            archive: tar.gz
+            bin: gostly-proxy
+          # macOS: native runners. macos-14 is arm64 (M-series), macos-13 is
+          # the last x86_64 hosted runner GitHub Actions exposes; using both
+          # avoids any cross-toolchain weirdness on Apple Silicon (codesign,
+          # rustls' ring asm, etc.).
+          - os: darwin
+            arch: amd64
+            runner: macos-13
+            triple: x86_64-apple-darwin
+            use_cross: false
+            archive: tar.gz
+            bin: gostly-proxy
+          - os: darwin
+            arch: arm64
+            runner: macos-14
+            triple: aarch64-apple-darwin
+            use_cross: false
+            archive: tar.gz
+            bin: gostly-proxy
+          # Windows: native windows-latest. We don't yet support arm64
+          # Windows — the user base is small and the cross-toolchain story
+          # is rough. Add when there's demand.
+          - os: windows
+            arch: amd64
+            runner: windows-latest
+            triple: x86_64-pc-windows-msvc
+            use_cross: false
+            archive: zip
+            bin: gostly-proxy.exe
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target.triple }}
+
+      - name: Install cross (Linux only)
+        if: matrix.target.use_cross
+        run: |
+          cargo install cross --git https://github.com/cross-rs/cross --locked --tag v0.2.5
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ matrix.target.triple }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.target.triple }}-
+
+      - name: Build (cross)
+        if: matrix.target.use_cross
+        working-directory: .
+        run: cross build --release --target ${{ matrix.target.triple }} --no-default-features --features oss
+
+      - name: Build (native)
+        if: matrix.target.use_cross == false
+        working-directory: .
+        run: cargo build --release --target ${{ matrix.target.triple }} --no-default-features --features oss
+
+      # The Cargo binary name is `gostly-agent`; we rename to `gostly-proxy`
+      # in the archive so the brew/scoop install steps land a `gostly`
+      # command that matches user-facing docs.
+      - name: Stage artifact (Linux/macOS)
+        if: matrix.target.os != 'windows'
+        run: |
+          STAGE="$(mktemp -d)"
+          cp "target/${{ matrix.target.triple }}/release/gostly-agent" "$STAGE/${{ matrix.target.bin }}"
+          tar -czf "gostly-proxy-${{ matrix.target.os }}-${{ matrix.target.arch }}.tar.gz" -C "$STAGE" "${{ matrix.target.bin }}"
+          ls -l "gostly-proxy-${{ matrix.target.os }}-${{ matrix.target.arch }}.tar.gz"
+
+      - name: Stage artifact (Windows)
+        if: matrix.target.os == 'windows'
+        shell: pwsh
+        run: |
+          $stage = New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\stage"
+          Copy-Item "target/${{ matrix.target.triple }}/release/gostly-agent.exe" "$stage/${{ matrix.target.bin }}"
+          Compress-Archive -Path "$stage/*" -DestinationPath "gostly-proxy-${{ matrix.target.os }}-${{ matrix.target.arch }}.zip"
+          Get-ChildItem "gostly-proxy-${{ matrix.target.os }}-${{ matrix.target.arch }}.zip"
+
+      - name: Compute SHA256 (Linux/macOS)
+        if: matrix.target.os != 'windows'
+        run: |
+          shasum -a 256 "gostly-proxy-${{ matrix.target.os }}-${{ matrix.target.arch }}.${{ matrix.target.archive }}" | tee "gostly-proxy-${{ matrix.target.os }}-${{ matrix.target.arch }}.${{ matrix.target.archive }}.sha256"
+
+      - name: Compute SHA256 (Windows)
+        if: matrix.target.os == 'windows'
+        shell: pwsh
+        run: |
+          $file = "gostly-proxy-${{ matrix.target.os }}-${{ matrix.target.arch }}.${{ matrix.target.archive }}"
+          $hash = (Get-FileHash $file -Algorithm SHA256).Hash.ToLower()
+          "$hash  $file" | Out-File -Encoding ascii "$file.sha256"
+          Get-Content "$file.sha256"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gostly-proxy-${{ matrix.target.os }}-${{ matrix.target.arch }}
+          path: |
+            gostly-proxy-${{ matrix.target.os }}-${{ matrix.target.arch }}.${{ matrix.target.archive }}
+            gostly-proxy-${{ matrix.target.os }}-${{ matrix.target.arch }}.${{ matrix.target.archive }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  # ── Aggregate: create the GitHub Release with all six tarballs ────────────
+  release:
+    name: publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List staged release assets
+        run: ls -la dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          # ── Manual SHA256 update flow for the brew formula ─────────────────
+          # After this release publishes, run:
+          #
+          #   bash tools/update-release-shas.sh v<version>
+          #
+          # which downloads each .sha256 sidecar, drops the values into
+          # Formula/gostly.rb and scoop/gostly.json, and opens a follow-up
+          # PR. We deliberately do NOT auto-commit from this workflow — the
+          # tap edit happens in a follow-up PR so a human can confirm the
+          # release artifacts look right before downstream channels start
+          # serving them.
+          body_path: ${{ github.workspace }}/.github/release-notes-footer.md
+          append_body: true
+
+  # ── Docker: multi-arch GHCR image ─────────────────────────────────────────
+  # `:latest` updates on every release. A tagged release also publishes
+  # `:vX.Y.Z`. See the file-header comment for cadence rationale.
+  docker:
+    name: build & push GHCR image
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU (multi-arch emulation)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push (multi-arch)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/nicrios/gostly-proxy:${{ steps.version.outputs.version }}
+            ghcr.io/nicrios/gostly-proxy:latest
+          build-args: |
+            CARGO_FEATURES=oss
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

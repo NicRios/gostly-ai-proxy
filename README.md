@@ -26,7 +26,7 @@ brew install nicrios/gostly/gostly
 ### Windows (Scoop)
 
 ```
-scoop bucket add gostly https://github.com/NicRios/spectre-ai
+scoop bucket add gostly https://github.com/NicRios/gostly-ai-proxy
 scoop install gostly
 ```
 
@@ -67,20 +67,14 @@ gostly mode learn   # flip back to recording
 
 Three modes per service. Mock library is plain JSONL — diffable, version-controllable, no proprietary format.
 
-## What's OSS vs cloud
+## Want more?
 
-| Feature                                  | OSS (this repo) | Cloud (gostly.ai) |
-|------------------------------------------|:---------------:|:-----------------:|
-| Recording proxy                          |        ✓        |         ✓         |
-| Replay engine                            |        ✓        |         ✓         |
-| OpenAPI / Postman / HAR import           |        ✓        |         ✓         |
-| Basic chaos primitives (latency, errors) |        ✓        |         ✓         |
-| AI gap-fill (LoRA on your traffic)       |        —        |         ✓         |
-| Multi-user dashboard                     |        —        |         ✓         |
-| Drift detection (v1 narrow)              |        —        |         ✓         |
-| Team features (SAML / RBAC / audit)      |        —        |     Q3 2026       |
+This repo is the recording proxy itself. AI gap-fill on traffic you've
+recorded, a multi-user dashboard, drift detection, and team features
+(SAML / RBAC / audit) live in the hosted Gostly product —
+<https://gostly.ai>.
 
-The OSS binary never calls `gostly.ai`. Verify with `strings $(which gostly) | grep gostly.ai` — should be empty.
+The binary in this repo runs entirely on your machine.
 
 ## Status
 
@@ -92,7 +86,7 @@ FSL-1.1-Apache-2.0. See [LICENSE.md](LICENSE.md). After 2 years from each releas
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). v1 scope is frozen — issue reports and bug-fix PRs welcome; new features go to the closed cloud product unless they fit the OSS scope.
+See [CONTRIBUTING.md](CONTRIBUTING.md). v1 scope is frozen — issue reports and bug-fix PRs welcome; larger features go to the hosted product at <https://gostly.ai>.
 
 ## Links
 
