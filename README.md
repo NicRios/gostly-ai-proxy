@@ -1,59 +1,102 @@
-# Gostly AI — Proxy
+# gostly
 
-Stop writing mocks. Gostly sits in front of your external API calls, records real traffic, and replays it — so your team can build and test without depending on live services.
+> Recording proxy. Record HTTP traffic, replay it as mocks. Apache-2.0 in 2 years.
 
-Recorded traffic stays on your machine — there's no Gostly cloud reading it.
+[![Build](https://github.com/NicRios/gostly-ai-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/NicRios/gostly-ai-proxy/actions)
+[![License: FSL-1.1-Apache-2.0](https://img.shields.io/badge/license-FSL--1.1--Apache--2.0-blue.svg)](LICENSE.md)
 
-## Quickstart
+## What it does
 
-**1. Sign up and get your credentials**
+Point gostly at an upstream HTTP service. It forwards real traffic and records every request/response pair to JSONL on disk. Flip a switch and it replays those recordings as mocks — your tests run with no network.
 
-Create an account at [gostly.ai](https://gostly.ai) and grab your license key and registry token from the dashboard.
+## Install
 
-**2. Authenticate with the Gostly registry**
-
-```bash
-docker login -u AWS -p <your-registry-token> 242201285974.dkr.ecr.us-east-1.amazonaws.com
-```
-
-**3. Configure `docker-compose.yml`**
-
-- Replace `YOUR_LICENSE_KEY` with your key
-- Set `BACKEND_URL` to the upstream service you want to mock
-
-**4. Start**
-
-```bash
-docker compose up
-```
-
-The proxy is now running on port `8080`. Point your app at it instead of the real service.
-
-## How it works
+### macOS / Linux
 
 ```
-Your app → Gostly proxy (8080) → Real upstream service
+curl -fsSL https://gostly.ai/install.sh | sh
 ```
 
-In **LEARN mode**, Gostly records every request/response pair.  
-In **MOCK mode**, Gostly replays recorded responses — no live service needed.
+### Homebrew
 
-When Gostly doesn't have an exact match, AI fallback generates a plausible response based on learned traffic patterns (Pro/Team).
+```
+brew install nicrios/gostly/gostly
+```
 
-For a deeper walkthrough of the components, match pipeline, and storage model, see [ARCHITECTURE.md](./ARCHITECTURE.md).
+### Windows (Scoop)
 
-## Ports
+```
+scoop bucket add gostly https://github.com/NicRios/spectre-ai
+scoop install gostly
+```
 
-| Port | Service |
-|------|---------|
-| 8080 | Proxy (point your app here) |
-| 3000 | Dashboard UI |
-| 8000 | Control plane API |
+### Docker
 
-## Docs
+```
+docker run -p 8080:8080 ghcr.io/nicrios/gostly-proxy:latest
+```
 
-Full documentation at [gostly.ai/docs](https://gostly.ai/docs)
+## Quick start
+
+```
+gostly start --upstream https://api.example.com
+# proxy listens on :8080, records traffic to ./data/traffic/
+
+# point your client at http://localhost:8080
+# requests pass through to upstream, responses get recorded
+
+gostly mode mock    # flip to MOCK mode — replays from library
+gostly mode learn   # flip back to recording
+```
+
+## Modes
+
+- **LEARN** — pass through, record traffic to JSONL
+- **MOCK** — replay from recorded library; falls back per config
+- **PASSTHROUGH** — pure pass-through (debugging)
+
+## Architecture
+
+```
+  your client  ──HTTP──▶  gostly :8080  ──HTTPS──▶  real upstream
+                              │
+                              ▼
+                       data/traffic/*.jsonl
+                       (append-only, on your machine)
+```
+
+Three modes per service. Mock library is plain JSONL — diffable, version-controllable, no proprietary format.
+
+## What's OSS vs cloud
+
+| Feature                                  | OSS (this repo) | Cloud (gostly.ai) |
+|------------------------------------------|:---------------:|:-----------------:|
+| Recording proxy                          |        ✓        |         ✓         |
+| Replay engine                            |        ✓        |         ✓         |
+| OpenAPI / Postman / HAR import           |        ✓        |         ✓         |
+| Basic chaos primitives (latency, errors) |        ✓        |         ✓         |
+| AI gap-fill (LoRA on your traffic)       |        —        |         ✓         |
+| Multi-user dashboard                     |        —        |         ✓         |
+| Drift detection (v1 narrow)              |        —        |         ✓         |
+| Team features (SAML / RBAC / audit)      |        —        |     Q3 2026       |
+
+The OSS binary never calls `gostly.ai`. Verify with `strings $(which gostly) | grep gostly.ai` — should be empty.
+
+## Status
+
+Active development. v0.1 release targeted Sat May 23 2026. Scope is frozen for v1 to keep maintenance solo-cadence-friendly.
 
 ## License
 
-A valid Gostly license key is required to run this software. [Get one at gostly.ai](https://gostly.ai).
+FSL-1.1-Apache-2.0. See [LICENSE.md](LICENSE.md). After 2 years from each release, that version automatically converts to Apache 2.0.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). v1 scope is frozen — issue reports and bug-fix PRs welcome; new features go to the closed cloud product unless they fit the OSS scope.
+
+## Links
+
+- Cloud product: https://gostly.ai
+- Docs: https://gostly.ai/docs
+- Issues: https://github.com/NicRios/gostly-ai-proxy/issues
+- Architecture deep dive: [ARCHITECTURE.md](ARCHITECTURE.md)
