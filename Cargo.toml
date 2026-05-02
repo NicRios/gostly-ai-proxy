@@ -1,0 +1,45 @@
+[package]
+name = "gostly-agent"
+version = "0.1.0"
+edition = "2021"
+
+# Build: cargo build --release
+[features]
+default = ["oss"]
+oss = []
+
+[dependencies]
+# Web Framework
+axum = { version = "0.7", features = ["macros"] }
+tokio = { version = "1.0", features = ["full"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["trace", "full"] }
+
+# HTTP body utilities (for collecting incoming request body)
+http-body-util = "0.1"
+
+# Observability
+tracing          = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+axum-prometheus  = "0.7"
+metrics          = "0.23"
+
+# Serialization
+serde      = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono     = { version = "0.4", features = ["serde"] }
+
+# HTTP client (supports HTTP + HTTPS backends)
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+
+uuid = { version = "1", features = ["v4"] }
+
+# Chaos injection
+rand = "0.8"
+parking_lot = "0.12"
+
+# CLI parser. The default `gostly` invocation with no subcommand boots the
+# proxy; subcommands are short HTTP clients to a running proxy. `derive`
+# is required for the #[derive(Parser)] / #[derive(Subcommand)] macros and
+# `env` lets `--upstream` fall back to the BACKEND_URL env var.
+clap = { version = "4", features = ["derive", "env"] }

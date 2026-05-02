@@ -4,9 +4,9 @@ Thanks for your interest. Read this first — it'll save you time.
 
 ## Scope freeze for v1
 
-The OSS proxy is intentionally narrow: record, replay, smart-swap, OpenAPI/Postman/HAR import, basic chaos primitives, single-binary distribution. **That's the v1 scope and it is frozen** through the v0.1 release (target: Sat May 23 2026).
+The proxy is intentionally narrow: record, replay, smart-swap, OpenAPI/Postman/HAR import, basic chaos primitives, single-binary distribution. **That's the v1 scope and it is frozen** through the v0.1 release (target: Sat May 23 2026).
 
-Anything beyond that — AI gap-fill, multi-user dashboards, drift detection, repair PRs, SAML/RBAC, hosted compliance — lives in the closed cloud product at [gostly.ai](https://gostly.ai). PRs that add those features here will be closed with a pointer to the cloud roadmap.
+Larger surface area — AI gap-fill, multi-user dashboards, drift detection, team features — lives in the hosted product at [gostly.ai](https://gostly.ai). PRs that add those features to this repo will be closed with a pointer to the hosted roadmap.
 
 This freeze exists so a single maintainer can keep up with reviews. It will be revisited after v1 ships.
 
@@ -20,7 +20,7 @@ Bug reports are very welcome. A good report includes:
 - What you expected vs. what happened
 - Minimal repro (a curl command + the upstream URL pattern is usually enough)
 
-Feature requests: open an issue tagged `proposal`. If it fits the v1 scope, great. If it's cloud-shaped, expect a redirect to gostly.ai. Either response is fine — don't take it personally.
+Feature requests: open an issue tagged `proposal`. If it fits the v1 scope, great. If it's hosted-product-shaped, expect a redirect to gostly.ai. Either response is fine — don't take it personally.
 
 ## Pull requests
 
@@ -30,24 +30,17 @@ New features (even small ones): open a discussion issue first. We'll confirm sco
 
 Required for any PR:
 
-- `cargo build` and `cargo build --features cloud` both succeed
+- `cargo build` succeeds
 - `cargo test` passes
 - `cargo clippy` adds no new warnings
-- The `oss-binary-no-cloud-symbols` CI gate passes
 
 ## Build instructions
 
 ```
 git clone https://github.com/NicRios/gostly-ai-proxy
 cd gostly-ai-proxy
-cargo build --release --no-default-features --features oss
+cargo build --release
 ./target/release/gostly --version
-```
-
-For the cloud-feature build (requires the closed-product source tree, not in this repo):
-
-```
-cargo build --release --features cloud
 ```
 
 ## Code of Conduct

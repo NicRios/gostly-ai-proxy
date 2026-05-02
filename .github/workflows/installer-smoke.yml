@@ -1,0 +1,226 @@
+name: installer smoke
+
+# Exercises the distribution channels (install.sh, brew formula, scoop
+# manifest) so a typo is caught at PR time, not after a release ships.
+
+on:
+  pull_request:
+    paths:
+      - 'install.sh'
+      - 'Formula/**'
+      - 'bucket/**'
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/installer-smoke.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: installer-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ubuntu-installer:
+    name: ubuntu install.sh smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Static-check install.sh
+        # ShellCheck is preinstalled on ubuntu-latest runners; bash -n is a
+        # syntax-only sanity check that runs before the linter.
+        run: |
+          bash -n install.sh
+          shellcheck install.sh
+
+      - name: Verify install.sh handles unsupported arch
+        # Spawn a subshell that reports a fake unsupported arch via
+        # uname-shadowing. The script must exit 1 cleanly, not crash.
+        run: |
+          set +e
+          (
+            # shellcheck disable=SC2329
+            uname() {
+              case "$1" in
+                -m) echo "sparc64" ;;
+                *) command uname "$@" ;;
+              esac
+            }
+            export -f uname
+            bash install.sh
+          )
+          rc=$?
+          if [ $rc -ne 1 ]; then
+            echo "Expected exit 1 on unsupported arch; got $rc" >&2
+            exit 1
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-smoke-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-smoke-
+
+      - name: Build binary from source
+        working-directory: .
+        run: cargo build --release --no-default-features --features oss
+
+      - name: "Smoke: binary builds + boots without panicking"
+        run: |
+          # Boot the binary with a hard 5s timeout to confirm it doesn't
+          # panic on init. Anything in the 128+sig range or 0 is treated
+          # as a successful boot.
+          BIN=./target/release/gostly-agent
+          test -x "$BIN" || { echo "Binary not executable: $BIN"; exit 1; }
+          file "$BIN"
+          set +e
+          # Stub out any port collision and any disk-write side-effects so
+          # the boot is purely a "did Rust panic on init?" smoke.
+          cd "$(mktemp -d)"
+          PROXY_PORT=18080 \
+          BACKEND_URL=http://127.0.0.1:9 \
+            "$OLDPWD/$BIN" >boot.log 2>&1 &
+          PID=$!
+          # Portable timeout: macOS runners don't ship GNU `timeout`. Sleep
+          # then kill instead. If the process has already exited by the
+          # time we check, that's a panic — read its exit code via wait.
+          sleep 5
+          if kill -0 "$PID" 2>/dev/null; then
+            # Still running after 5s = booted cleanly. Send SIGTERM and
+            # treat that as success (143 = SIGTERM exit).
+            kill -TERM "$PID" 2>/dev/null || true
+            wait "$PID" 2>/dev/null
+            rc=$?
+            # Some shells report wait on SIGTERM as 143, others as -15, etc.
+            # Anything in the 128+sig range is a normal kill, not a panic.
+            if [ "$rc" -ge 128 ] || [ "$rc" -eq 0 ]; then
+              echo "Boot smoke OK (proc still running at 5s, killed cleanly; rc=$rc)"
+              rc=0
+            fi
+          else
+            wait "$PID" 2>/dev/null
+            rc=$?
+          fi
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "Binary failed boot smoke (exit $rc):"
+            cat boot.log
+            exit 1
+          fi
+          echo "Boot smoke OK"
+
+  macos-build:
+    name: macos build-from-source smoke
+    runs-on: macos-14
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate Formula syntax
+        run: |
+          # Ruby parser-only check. Doesn't require Homebrew.
+          ruby -c Formula/gostly.rb
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-smoke-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-smoke-
+
+      - name: Build binary
+        working-directory: .
+        run: cargo build --release --no-default-features --features oss
+
+      - name: "Smoke: binary builds + boots without panicking"
+        run: |
+          # Boot the binary with a hard 5s timeout to confirm it doesn't
+          # panic on init. Anything in the 128+sig range or 0 is treated
+          # as a successful boot.
+          BIN=./target/release/gostly-agent
+          test -x "$BIN" || { echo "Binary not executable: $BIN"; exit 1; }
+          file "$BIN"
+          set +e
+          # Stub out any port collision and any disk-write side-effects so
+          # the boot is purely a "did Rust panic on init?" smoke.
+          cd "$(mktemp -d)"
+          PROXY_PORT=18080 \
+          BACKEND_URL=http://127.0.0.1:9 \
+            "$OLDPWD/$BIN" >boot.log 2>&1 &
+          PID=$!
+          # Portable timeout: macOS runners don't ship GNU `timeout`. Sleep
+          # then kill instead. If the process has already exited by the
+          # time we check, that's a panic — read its exit code via wait.
+          sleep 5
+          if kill -0 "$PID" 2>/dev/null; then
+            # Still running after 5s = booted cleanly. Send SIGTERM and
+            # treat that as success (143 = SIGTERM exit).
+            kill -TERM "$PID" 2>/dev/null || true
+            wait "$PID" 2>/dev/null
+            rc=$?
+            # Some shells report wait on SIGTERM as 143, others as -15, etc.
+            # Anything in the 128+sig range is a normal kill, not a panic.
+            if [ "$rc" -ge 128 ] || [ "$rc" -eq 0 ]; then
+              echo "Boot smoke OK (proc still running at 5s, killed cleanly; rc=$rc)"
+              rc=0
+            fi
+          else
+            wait "$PID" 2>/dev/null
+            rc=$?
+          fi
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "Binary failed boot smoke (exit $rc):"
+            cat boot.log
+            exit 1
+          fi
+          echo "Boot smoke OK"
+
+  scoop-manifest-validate:
+    name: scoop manifest JSON validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate bucket/gostly.json (Scoop manifest) is well-formed JSON
+        run: |
+          python3 -c 'import json,sys; json.load(open("bucket/gostly.json")); print("ok")'
+
+      - name: Sanity-check required keys
+        run: |
+          python3 - <<'PY'
+          import json, sys
+          m = json.load(open("bucket/gostly.json"))
+          required = ["version", "description", "homepage", "license", "architecture", "bin", "autoupdate"]
+          missing = [k for k in required if k not in m]
+          if missing:
+              print(f"Missing required keys: {missing}", file=sys.stderr)
+              sys.exit(1)
+          if "64bit" not in m["architecture"]:
+              print("Missing architecture.64bit", file=sys.stderr)
+              sys.exit(1)
+          if "url" not in m["architecture"]["64bit"] or "hash" not in m["architecture"]["64bit"]:
+              print("Missing architecture.64bit.url or .hash", file=sys.stderr)
+              sys.exit(1)
+          print("scoop manifest looks structurally valid")
+          PY
