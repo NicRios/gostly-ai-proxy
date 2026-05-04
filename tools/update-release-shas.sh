@@ -41,20 +41,22 @@ PLATFORMS=(
   "windows-amd64.zip"
 )
 
-declare -A SHAS
+# Each .sha256 sidecar is fetched into $TMP and read back via sha_for().
+# Avoids `declare -A` so this stays compatible with bash 3.2 (macOS).
+sha_for() {
+  awk '{print $1}' "$TMP/$1.sha256"
+}
 
 for p in "${PLATFORMS[@]}"; do
   url="https://github.com/${REPO}/releases/download/${TAG}/gostly-proxy-${p}.sha256"
   echo "Fetching $url ..."
   curl -fsSL -o "$TMP/${p}.sha256" "$url"
-  # The .sha256 file is `<hash>  <filename>` — first token only.
-  SHAS["$p"]="$(awk '{print $1}' "$TMP/${p}.sha256")"
 done
 
 echo
 echo "Resolved SHAs for $TAG:"
 for p in "${PLATFORMS[@]}"; do
-  printf '  %-22s %s\n' "$p" "${SHAS[$p]}"
+  printf '  %-22s %s\n' "$p" "$(sha_for "$p")"
 done
 echo
 
@@ -71,7 +73,12 @@ sed -i.bak \
 # can't reliably know which sha256 line follows which url. Python keeps
 # this idempotent across releases (initial placeholders, last release's
 # values, or any combination).
-python3 - "$FORMULA" "${SHAS[darwin-arm64.tar.gz]}" "${SHAS[darwin-amd64.tar.gz]}" "${SHAS[linux-arm64.tar.gz]}" "${SHAS[linux-amd64.tar.gz]}" <<'PY'
+python3 - "$FORMULA" \
+  "$(sha_for darwin-arm64.tar.gz)" \
+  "$(sha_for darwin-amd64.tar.gz)" \
+  "$(sha_for linux-arm64.tar.gz)" \
+  "$(sha_for linux-amd64.tar.gz)" \
+  <<'PY'
 import re, sys
 path, dar, dam, lar, lam = sys.argv[1:]
 text = open(path).read()
@@ -100,7 +107,7 @@ rm -f "$FORMULA.bak"
 SCOOP="$ROOT/bucket/gostly.json"
 echo "Patching $SCOOP ..."
 
-python3 - "$SCOOP" "$VERSION" "$TAG" "${SHAS[windows-amd64.zip]}" <<'PY'
+python3 - "$SCOOP" "$VERSION" "$TAG" "$(sha_for windows-amd64.zip)" <<'PY'
 import json, sys
 path, version, tag, win_hash = sys.argv[1:]
 with open(path) as f:
@@ -109,7 +116,7 @@ m["version"] = version
 m["architecture"]["64bit"]["url"] = f"https://github.com/NicRios/gostly-ai-proxy/releases/download/{tag}/gostly-proxy-windows-amd64.zip"
 m["architecture"]["64bit"]["hash"] = win_hash
 with open(path, "w") as f:
-    json.dump(m, f, indent=2)
+    json.dump(m, f, indent=2, ensure_ascii=False)
     f.write("\n")
 print("scoop manifest patched")
 PY

@@ -24,22 +24,22 @@ class Gostly < Formula
   on_macos do
     on_arm do
       url "https://github.com/NicRios/gostly-ai-proxy/releases/download/v0.1.0/gostly-proxy-darwin-arm64.tar.gz"
-      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+      sha256 "b529a757180991c433d320401947e8028bf1381386e0137d3fb8ee97c412bec4"
     end
     on_intel do
       url "https://github.com/NicRios/gostly-ai-proxy/releases/download/v0.1.0/gostly-proxy-darwin-amd64.tar.gz"
-      sha256 "0000000000000000000000000000000000000000000000000000000000000001"
+      sha256 "426cc3d330d05a25931b1059c9f6e58e98a652910970e2e13a8e08312450f2ba"
     end
   end
 
   on_linux do
     on_arm do
       url "https://github.com/NicRios/gostly-ai-proxy/releases/download/v0.1.0/gostly-proxy-linux-arm64.tar.gz"
-      sha256 "0000000000000000000000000000000000000000000000000000000000000002"
+      sha256 "d61aead465e220254fd41b189c4a15801bd653149d904145c81441723cb27eff"
     end
     on_intel do
       url "https://github.com/NicRios/gostly-ai-proxy/releases/download/v0.1.0/gostly-proxy-linux-amd64.tar.gz"
-      sha256 "0000000000000000000000000000000000000000000000000000000000000003"
+      sha256 "662c61cd038ef579c73c761a15d6fd2f486132af364192cd27c71623e0a2d196"
     end
   end
 

@@ -6,7 +6,7 @@
   "architecture": {
     "64bit": {
       "url": "https://github.com/NicRios/gostly-ai-proxy/releases/download/v0.1.0/gostly-proxy-windows-amd64.zip",
-      "hash": "TODO_FILL_AFTER_FIRST_RELEASE_WINDOWS_AMD64"
+      "hash": "bcce7b2915c3d3458482a9f1d64a94ff922ed9afb4ffda120f2c557ea85c75c3"
     }
   },
   "bin": [
