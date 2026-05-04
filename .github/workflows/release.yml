@@ -114,11 +114,20 @@ jobs:
       - name: Build (cross)
         if: matrix.target.use_cross
         working-directory: .
+        env:
+          # Short SHA gets baked into the binary's `--version` output
+          # via `option_env!("GOSTLY_BUILD_COMMIT")` in main.rs.
+          GOSTLY_BUILD_COMMIT: ${{ github.sha }}
+          # cross-rs runs the build in a Docker container; CROSS_CONTAINER_OPTS
+          # propagates the env var into that container.
+          CROSS_CONTAINER_OPTS: -e GOSTLY_BUILD_COMMIT
         run: cross build --release --target ${{ matrix.target.triple }} --no-default-features --features oss
 
       - name: Build (native)
         if: matrix.target.use_cross == false
         working-directory: .
+        env:
+          GOSTLY_BUILD_COMMIT: ${{ github.sha }}
         run: cargo build --release --target ${{ matrix.target.triple }} --no-default-features --features oss
 
       # The Cargo binary name is `gostly-agent`; we rename to `gostly-proxy`
@@ -254,5 +263,6 @@ jobs:
             ghcr.io/nicrios/gostly-proxy:latest
           build-args: |
             CARGO_FEATURES=oss
+            GOSTLY_BUILD_COMMIT=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

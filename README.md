@@ -39,15 +39,32 @@ docker run -p 8080:8080 \
   ghcr.io/nicrios/gostly-proxy:latest
 ```
 
-## Quick start
+To persist the mock library across container restarts, bind-mount a host directory at `/app/data`. The host directory must be writable by uid 65532 (the nonroot user the image runs as):
 
 ```
-# replace https://api.example.com with the upstream you want to record
-gostly start --upstream https://api.example.com
-# proxy listens on :8080, records traffic to ./data/traffic/
+mkdir -p data && sudo chown 65532:65532 data
+docker run -p 8080:8080 \
+  -e BACKEND_URL=https://api.example.com \
+  -v "$(pwd)/data:/app/data" \
+  ghcr.io/nicrios/gostly-proxy:latest
+```
 
-# point your client at http://localhost:8080
-# requests pass through to upstream, responses get recorded
+## Quick start
+
+You always need to tell gostly *what upstream to record*. Pick one of:
+
+```bash
+# CLI flag
+gostly start --upstream https://api.example.com
+
+# or env var (also how the docker image is configured)
+BACKEND_URL=https://api.example.com gostly start
+```
+
+Then point your client at `http://localhost:8080` instead of the real upstream:
+
+```
+# proxy is on :8080, recording everything to ./data/traffic/
 
 gostly mode mock    # flip to MOCK mode — replays from library
 gostly mode learn   # flip back to recording
@@ -58,6 +75,24 @@ gostly mode learn   # flip back to recording
 - **LEARN** — pass through, record traffic to JSONL
 - **MOCK** — replay from recorded library; falls back per config
 - **PASSTHROUGH** — pure pass-through (debugging)
+
+## Multi-service
+
+Route by `Host` header or path prefix to any number of upstreams in a single proxy. Each service gets its own mock library, mode, chaos config, and redaction rules — so service-A can be recording while service-B is replaying, in the same instance.
+
+```
+POST /ghost/upstreams
+{
+  "upstreams": [
+    {"routing_type":"host","routing_value":"api.stripe.com",  "service_id":"stripe",  "upstream_url":"https://api.stripe.com",  "mode":"LEARN"},
+    {"routing_type":"host","routing_value":"api.twilio.com",  "service_id":"twilio",  "upstream_url":"https://api.twilio.com",  "mode":"MOCK"},
+    {"routing_type":"path","routing_value":"/api/orders",     "service_id":"orders",  "upstream_url":"http://orders.local"},
+    {"routing_type":"path","routing_value":"/api/billing",    "service_id":"billing", "upstream_url":"http://billing.local"}
+  ]
+}
+```
+
+No cap on services. No cap on mocks per service.
 
 ## Architecture
 
