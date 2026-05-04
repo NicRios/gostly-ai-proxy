@@ -1,12 +1,12 @@
 {
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "OSS recording proxy — record, mock, replay HTTP traffic",
   "homepage": "https://gostly.ai",
   "license": "FSL-1.1-Apache-2.0",
   "architecture": {
     "64bit": {
-      "url": "https://github.com/NicRios/gostly-ai-proxy/releases/download/v0.1.1/gostly-proxy-windows-amd64.zip",
-      "hash": "9f08d884e6b55808ac092649e79e3883282528e3e029946583d1ee09a51f1dc0"
+      "url": "https://github.com/NicRios/gostly-ai-proxy/releases/download/v0.2.0/gostly-proxy-windows-amd64.zip",
+      "hash": "276418f440f4cd09c3cb7dae9147809ac38e4cefd90bb77da547829a3dfeff1d"
     }
   },
   "bin": [
