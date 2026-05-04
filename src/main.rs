@@ -2,10 +2,7 @@ use axum::{
     body::Body,
     extract::{Path, Request, State},
     http::{HeaderValue, Response, StatusCode},
-    // `delete` import currently unused — only the sequence routes used DELETE,
-    // and those are commented out while sequences are in-development. Re-add
-    // when sequences ship.
-    routing::{any, get, post},
+    routing::{any, delete, get, post},
     Json, Router,
 };
 use axum_prometheus::PrometheusMetricLayer;
@@ -149,7 +146,6 @@ struct AppState {
     upstreams:               Arc<RwLock<Vec<UpstreamRoute>>>,
     backend_url:             String,
     mock_dir:                String,
-    #[allow(dead_code)]  // sequences in-development; field still loaded on boot but unused after routes commented out
     sequence_file_path:      String,
     mode_file_path:          String,
     redact_headers:          Vec<String>,
@@ -761,13 +757,15 @@ async fn run_proxy() {
         .route("/ghost/mocks",     get(handle_list_mocks))
         .route("/ghost/reload",    post(handle_reload_mocks))
         .route("/ghost/unmatched", get(handle_list_unmatched))
-        // ── Sequence admin (in-development; routes commented out) ──
-        // Re-enable when the sequences feature ships — handlers + data
-        // structures + io::load are kept intact under the hood for that
-        // re-enable.
-        // .route("/ghost/sequences",           get(handle_list_sequences).post(handle_create_sequence))
-        // .route("/ghost/sequences/:id/reset", post(handle_reset_sequence))
-        // .route("/ghost/sequences/:id",       delete(handle_delete_sequence))
+        // ── Sequence admin (v0.2.0+) ────────────────────────────────────
+        // Sequences map a single endpoint to an ordered list of responses,
+        // advancing the cursor on each call. Useful for testing retry
+        // logic, polling endpoints, and multi-step flows. The proxy
+        // hot path already consults sequences first; these routes give
+        // operators the API to manage them.
+        .route("/ghost/sequences",           get(handle_list_sequences).post(handle_create_sequence))
+        .route("/ghost/sequences/:id/reset", post(handle_reset_sequence))
+        .route("/ghost/sequences/:id",       delete(handle_delete_sequence))
         // ── Multi-stream routing ──
         .route("/ghost/upstreams", post(handle_set_upstreams))
         // ── Proxy (must be last) ──
@@ -869,13 +867,11 @@ async fn handle_set_config(
 
 // ─── Sequences ────────────────────────────────────────────────────────────────
 
-#[allow(dead_code)]  // sequences in-development; routes commented out, see Router::new() above
 async fn handle_list_sequences(State(state): State<AppState>) -> Json<serde_json::Value> {
     let s = state.sequences.read().await;
     Json(serde_json::json!({ "count": s.len(), "sequences": *s }))
 }
 
-#[allow(dead_code)]  // sequences in-development; routes commented out, see Router::new() above
 async fn handle_create_sequence(
     State(state): State<AppState>,
     Json(seq): Json<MockSequence>,
@@ -892,7 +888,6 @@ async fn handle_create_sequence(
     Json(serde_json::json!({ "status": "ok", "id": id }))
 }
 
-#[allow(dead_code)]  // sequences in-development; routes commented out, see Router::new() above
 async fn handle_reset_sequence(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -902,7 +897,6 @@ async fn handle_reset_sequence(
     Json(serde_json::json!({ "status": "ok", "id": id }))
 }
 
-#[allow(dead_code)]  // sequences in-development; routes commented out, see Router::new() above
 async fn handle_delete_sequence(
     State(state): State<AppState>,
     Path(id): Path<String>,

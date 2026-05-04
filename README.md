@@ -76,6 +76,29 @@ gostly mode learn   # flip back to recording
 - **MOCK** — replay from recorded library; falls back per config
 - **PASSTHROUGH** — pure pass-through (debugging)
 
+## Sequences
+
+For testing retry logic, polling endpoints, or multi-step flows: define an ordered list of responses for a single endpoint. The cursor advances on each call.
+
+```
+POST /ghost/sequences
+{
+  "id": "checkout-retry",
+  "method": "POST",
+  "uri": "/api/checkout",
+  "responses": [
+    {"status": 503, "body": "{\"error\": \"transient\"}"},
+    {"status": 503, "body": "{\"error\": \"transient\"}"},
+    {"status": 200, "body": "{\"order_id\": \"ord_123\"}"}
+  ],
+  "loop_responses": false
+}
+```
+
+`POST /ghost/sequences/{id}/reset` rewinds the cursor.
+`DELETE /ghost/sequences/{id}` removes the sequence.
+`GET /ghost/sequences` lists everything currently loaded.
+
 ## Multi-service
 
 Route by `Host` header or path prefix to any number of upstreams in a single proxy. Each service gets its own mock library, mode, chaos config, and redaction rules — so service-A can be recording while service-B is replaying, in the same instance.
