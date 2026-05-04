@@ -2,7 +2,7 @@
 
 > Recording proxy. Record HTTP traffic, replay it as mocks. Apache-2.0 in 2 years.
 
-[![Build](https://github.com/NicRios/gostly-ai-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/NicRios/gostly-ai-proxy/actions)
+[![Build](https://github.com/NicRios/gostly-ai-proxy/actions/workflows/build.yml/badge.svg)](https://github.com/NicRios/gostly-ai-proxy/actions)
 [![License: FSL-1.1-Apache-2.0](https://img.shields.io/badge/license-FSL--1.1--Apache--2.0-blue.svg)](LICENSE.md)
 
 ## What it does
@@ -14,31 +14,35 @@ Point gostly at an upstream HTTP service. It forwards real traffic and records e
 ### macOS / Linux
 
 ```
-curl -fsSL https://gostly.ai/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/NicRios/gostly-ai-proxy/main/install.sh | bash
 ```
 
 ### Homebrew
 
 ```
-brew install nicrios/gostly/gostly
+brew tap nicrios/gostly https://github.com/NicRios/gostly-ai-proxy
+brew install gostly
 ```
 
 ### Windows (Scoop)
 
 ```
-scoop bucket add gostly https://github.com/NicRios/spectre-ai
+scoop bucket add gostly https://github.com/NicRios/gostly-ai-proxy
 scoop install gostly
 ```
 
 ### Docker
 
 ```
-docker run -p 8080:8080 ghcr.io/nicrios/gostly-proxy:latest
+docker run -p 8080:8080 \
+  -e BACKEND_URL=https://api.example.com \
+  ghcr.io/nicrios/gostly-proxy:latest
 ```
 
 ## Quick start
 
 ```
+# replace https://api.example.com with the upstream you want to record
 gostly start --upstream https://api.example.com
 # proxy listens on :8080, records traffic to ./data/traffic/
 
@@ -67,24 +71,18 @@ gostly mode learn   # flip back to recording
 
 Three modes per service. Mock library is plain JSONL — diffable, version-controllable, no proprietary format.
 
-## What's OSS vs cloud
+## Want more?
 
-| Feature                                  | OSS (this repo) | Cloud (gostly.ai) |
-|------------------------------------------|:---------------:|:-----------------:|
-| Recording proxy                          |        ✓        |         ✓         |
-| Replay engine                            |        ✓        |         ✓         |
-| OpenAPI / Postman / HAR import           |        ✓        |         ✓         |
-| Basic chaos primitives (latency, errors) |        ✓        |         ✓         |
-| AI gap-fill (LoRA on your traffic)       |        —        |         ✓         |
-| Multi-user dashboard                     |        —        |         ✓         |
-| Drift detection (v1 narrow)              |        —        |         ✓         |
-| Team features (SAML / RBAC / audit)      |        —        |     Q3 2026       |
+This repo is the recording proxy itself. AI gap-fill on traffic you've
+recorded, a multi-user dashboard, drift detection, and team features
+(SAML / RBAC / audit) live in the hosted Gostly product —
+<https://gostly.ai>.
 
-The OSS binary never calls `gostly.ai`. Verify with `strings $(which gostly) | grep gostly.ai` — should be empty.
+The binary in this repo runs entirely on your machine.
 
 ## Status
 
-Active development. v0.1 release targeted Sat May 23 2026. Scope is frozen for v1 to keep maintenance solo-cadence-friendly.
+Active development. Scope is frozen for v1 to keep maintenance solo-cadence-friendly.
 
 ## License
 
@@ -92,11 +90,10 @@ FSL-1.1-Apache-2.0. See [LICENSE.md](LICENSE.md). After 2 years from each releas
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). v1 scope is frozen — issue reports and bug-fix PRs welcome; new features go to the closed cloud product unless they fit the OSS scope.
+See [CONTRIBUTING.md](CONTRIBUTING.md). v1 scope is frozen — issue reports and bug-fix PRs welcome; larger features go to the hosted product at <https://gostly.ai>.
 
 ## Links
 
-- Cloud product: https://gostly.ai
-- Docs: https://gostly.ai/docs
+- Hosted product: https://gostly.ai
 - Issues: https://github.com/NicRios/gostly-ai-proxy/issues
 - Architecture deep dive: [ARCHITECTURE.md](ARCHITECTURE.md)
