@@ -58,13 +58,13 @@ jobs:
             use_cross: true
             archive: tar.gz
             bin: gostly-proxy
-          # macOS: native runners. macos-14 is arm64 (M-series), macos-13 is
-          # the last x86_64 hosted runner GitHub Actions exposes; using both
-          # avoids any cross-toolchain weirdness on Apple Silicon (codesign,
-          # rustls' ring asm, etc.).
+          # macOS: both targets build on macos-14 (arm64 M-series). The
+          # x86_64 build is a cross-compile via the toolchain's
+          # `x86_64-apple-darwin` target — the hosted macos-13 (x86_64)
+          # pool has long queues and is being deprecated.
           - os: darwin
             arch: amd64
-            runner: macos-13
+            runner: macos-14
             triple: x86_64-apple-darwin
             use_cross: false
             archive: tar.gz
