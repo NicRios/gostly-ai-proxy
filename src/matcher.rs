@@ -4,13 +4,26 @@ use crate::io::ServiceMocks;
 
 // ─── Primary match functions ───────────────────────────────────────────────────
 
-/// Exact match only: method + uri + body must all match.
+/// Exact match only: method + uri + body + tenant must all match.
 ///
 /// # Complexity
-/// O(1) — direct HashMap lookup by (method, uri), then body equality check.
-/// The per-service ServiceMocks map is keyed by (method, uri) so no scan is needed.
-pub fn find_exact(mocks: &ServiceMocks, method: &str, uri: &str, body: &str) -> Option<MockEntry> {
-    let key = (method.to_string(), uri.to_string());
+/// O(1) — direct HashMap lookup by (method, uri, tenant), then body equality check.
+/// The per-service ServiceMocks map is keyed by (method, uri, tenant) so no scan is needed.
+///
+/// # Tenant scoping (v0.3, feature #7)
+/// The lookup is strictly tenant-scoped. A request under `tenant = "worker-3"`
+/// will never see entries written under `tenant = "_global"` or any other
+/// tenant. Cross-tenant fallback is the caller's responsibility — typically
+/// the `_global` tenant is used as a shared library that every test sees,
+/// while per-test mocks land under their own tenant.
+///
+/// The handler hot path uses `MockLibrary::find_exact` directly (one fewer
+/// indirection across segments). This helper is kept for tests and any
+/// caller that already holds a `ServiceMocks` slice — for example, the
+/// older shape used by `to_service_mocks` test fixtures.
+#[allow(dead_code)]
+pub fn find_exact(mocks: &ServiceMocks, method: &str, uri: &str, body: &str, tenant: &str) -> Option<MockEntry> {
+    let key = (method.to_string(), uri.to_string(), tenant.to_string());
     mocks.get(&key).filter(|m| m.request.body == body).cloned()
 }
 
@@ -349,7 +362,10 @@ mod tests {
 
     fn to_service_mocks(entries: Vec<MockEntry>) -> ServiceMocks {
         entries.into_iter()
-            .map(|e| ((e.request.method.clone(), e.request.uri.clone()), e))
+            .map(|e| (
+                (e.request.method.clone(), e.request.uri.clone(), e.tenant.clone()),
+                e,
+            ))
             .collect()
     }
 
@@ -358,6 +374,7 @@ mod tests {
             id: format!("{method}:{uri}"),
             timestamp: "2024-01-01T00:00:00Z".to_string(),
             service_id: None,
+            tenant: crate::GLOBAL_TENANT.to_string(),
             request: MockRequest {
                 method: method.to_string(),
                 uri: uri.to_string(),
@@ -484,7 +501,7 @@ mod tests {
     #[test]
     fn test_find_exact_match() {
         let mocks = to_service_mocks(vec![mock("GET", "/users/1", "", r#"{"id":1}"#)]);
-        let result = find_exact(&mocks, "GET", "/users/1", "");
+        let result = find_exact(&mocks, "GET", "/users/1", "", crate::GLOBAL_TENANT);
         assert!(result.is_some());
         assert_eq!(result.unwrap().response.body, r#"{"id":1}"#);
     }
@@ -492,19 +509,19 @@ mod tests {
     #[test]
     fn test_find_exact_no_match_wrong_method() {
         let mocks = to_service_mocks(vec![mock("GET", "/users/1", "", r#"{"id":1}"#)]);
-        assert!(find_exact(&mocks, "POST", "/users/1", "").is_none());
+        assert!(find_exact(&mocks, "POST", "/users/1", "", crate::GLOBAL_TENANT).is_none());
     }
 
     #[test]
     fn test_find_exact_no_match_wrong_uri() {
         let mocks = to_service_mocks(vec![mock("GET", "/users/1", "", r#"{"id":1}"#)]);
-        assert!(find_exact(&mocks, "GET", "/users/2", "").is_none());
+        assert!(find_exact(&mocks, "GET", "/users/2", "", crate::GLOBAL_TENANT).is_none());
     }
 
     #[test]
     fn test_find_exact_body_must_match() {
         let mocks = to_service_mocks(vec![mock("POST", "/login", r#"{"user":"alice"}"#, r#"{"token":"tok1"}"#)]);
-        assert!(find_exact(&mocks, "POST", "/login", r#"{"user":"bob"}"#).is_none());
+        assert!(find_exact(&mocks, "POST", "/login", r#"{"user":"bob"}"#, crate::GLOBAL_TENANT).is_none());
     }
 
     #[test]
@@ -514,8 +531,30 @@ mod tests {
             mock("GET", "/items", "", r#"{"version":1}"#),
             mock("GET", "/items", "", r#"{"version":2}"#),
         ]);
-        let result = find_exact(&mocks, "GET", "/items", "").unwrap();
+        let result = find_exact(&mocks, "GET", "/items", "", crate::GLOBAL_TENANT).unwrap();
         assert_eq!(result.response.body, r#"{"version":2}"#);
+    }
+
+    #[test]
+    fn test_find_exact_tenant_isolation() {
+        // Mocks under different tenants are not cross-visible — even with the
+        // exact same (method, uri). This is the load-bearing invariant for
+        // per-test isolation (v0.3, feature #7).
+        let mut a = mock("GET", "/items", "", r#"{"tenant":"a"}"#);
+        a.tenant = "test-a".to_string();
+        let mut b = mock("GET", "/items", "", r#"{"tenant":"b"}"#);
+        b.tenant = "test-b".to_string();
+        let mocks = to_service_mocks(vec![a, b]);
+
+        let from_a = find_exact(&mocks, "GET", "/items", "", "test-a").unwrap();
+        let from_b = find_exact(&mocks, "GET", "/items", "", "test-b").unwrap();
+        assert_eq!(from_a.response.body, r#"{"tenant":"a"}"#);
+        assert_eq!(from_b.response.body, r#"{"tenant":"b"}"#);
+
+        // A request under a tenant that doesn't match either entry → None.
+        assert!(find_exact(&mocks, "GET", "/items", "", crate::GLOBAL_TENANT).is_none(),
+            "tenant lookup must not fall back to _global");
+        assert!(find_exact(&mocks, "GET", "/items", "", "test-c").is_none());
     }
 
     // ── find_smart_swap ───────────────────────────────────────────────────────
@@ -646,7 +685,10 @@ mod tests_alpha {
 
     fn to_service_mocks(entries: Vec<MockEntry>) -> ServiceMocks {
         entries.into_iter()
-            .map(|e| ((e.request.method.clone(), e.request.uri.clone()), e))
+            .map(|e| (
+                (e.request.method.clone(), e.request.uri.clone(), e.tenant.clone()),
+                e,
+            ))
             .collect()
     }
 
@@ -657,6 +699,7 @@ mod tests_alpha {
             id: format!("{method}:{uri}"),
             timestamp: "2024-01-01T00:00:00Z".to_string(),
             service_id: None,
+            tenant: crate::GLOBAL_TENANT.to_string(),
             request: MockRequest {
                 method: method.to_string(),
                 uri: uri.to_string(),
@@ -827,14 +870,14 @@ mod tests_alpha {
     #[test]
     fn test_alpha_find_exact_empty_body_match() {
         let mocks = to_service_mocks(vec![mock("DELETE", "/items/1", "", r#"{"deleted":true}"#)]);
-        let result = find_exact(&mocks, "DELETE", "/items/1", "");
+        let result = find_exact(&mocks, "DELETE", "/items/1", "", crate::GLOBAL_TENANT);
         assert!(result.is_some());
     }
 
     #[test]
     fn test_alpha_find_exact_method_case_sensitive() {
         let mocks = to_service_mocks(vec![mock("GET", "/items", "", r#"{}"#)]);
-        assert!(find_exact(&mocks, "get", "/items", "").is_none());
+        assert!(find_exact(&mocks, "get", "/items", "", crate::GLOBAL_TENANT).is_none());
     }
 
     #[test]
@@ -843,8 +886,8 @@ mod tests_alpha {
             mock("GET",  "/items", "", r#"{"method":"GET"}"#),
             mock("POST", "/items", "", r#"{"method":"POST"}"#),
         ]);
-        let get_result  = find_exact(&mocks, "GET",  "/items", "").unwrap();
-        let post_result = find_exact(&mocks, "POST", "/items", "").unwrap();
+        let get_result  = find_exact(&mocks, "GET",  "/items", "", crate::GLOBAL_TENANT).unwrap();
+        let post_result = find_exact(&mocks, "POST", "/items", "", crate::GLOBAL_TENANT).unwrap();
         assert!(get_result.response.body.contains("GET"));
         assert!(post_result.response.body.contains("POST"));
     }
@@ -852,13 +895,13 @@ mod tests_alpha {
     #[test]
     fn test_alpha_find_exact_body_whitespace_not_normalised() {
         let mocks = to_service_mocks(vec![mock("POST", "/data", r#"{"k":"v"}"#, "ok")]);
-        assert!(find_exact(&mocks, "POST", "/data", r#"{ "k": "v" }"#).is_none());
+        assert!(find_exact(&mocks, "POST", "/data", r#"{ "k": "v" }"#, crate::GLOBAL_TENANT).is_none());
     }
 
     #[test]
     fn test_alpha_find_exact_empty_library_returns_none() {
         let mocks: ServiceMocks = ServiceMocks::new();
-        assert!(find_exact(&mocks, "GET", "/anything", "").is_none());
+        assert!(find_exact(&mocks, "GET", "/anything", "", crate::GLOBAL_TENANT).is_none());
     }
 
     // ── find_smart_swap — extended scenarios ──────────────────────────────────

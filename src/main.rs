@@ -65,29 +65,43 @@ enum Mode { Learn, Mock, Passthrough, Transitioning }
 
 // ─── Mock library types ───────────────────────────────────────────────────────
 
+/// Default tenant for mocks and requests that don't carry an explicit
+/// `X-Gostly-Tenant` header / `?_tenant=...` query param. Backwards-compat
+/// JSONL files written before v0.3 (no tenant field at all) deserialize
+/// to this value.
+pub const GLOBAL_TENANT: &str = "_global";
+
+fn default_tenant() -> String { GLOBAL_TENANT.to_string() }
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
-struct MockRequest {
-    method: String,
-    uri:    String,
-    body:   String,
+pub(crate) struct MockRequest {
+    pub method: String,
+    pub uri:    String,
+    pub body:   String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-struct MockResponse {
-    status:     u16,
-    headers:    HashMap<String, String>,
-    body:       String,
-    latency_ms: u64,
+pub(crate) struct MockResponse {
+    pub status:     u16,
+    pub headers:    HashMap<String, String>,
+    pub body:       String,
+    pub latency_ms: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-struct MockEntry {
-    id:        String,
-    timestamp: String,
-    request:   MockRequest,
-    response:  MockResponse,
+pub(crate) struct MockEntry {
+    pub id:        String,
+    pub timestamp: String,
+    pub request:   MockRequest,
+    pub response:  MockResponse,
     #[serde(skip_serializing_if = "Option::is_none")]
-    service_id: Option<String>,
+    pub service_id: Option<String>,
+    /// Per-test isolation namespace (v0.3, feature #7). Default `_global`.
+    /// JSONL files written before v0.3 lack this field entirely; serde's
+    /// `default = "default_tenant"` makes them load as `_global` so the
+    /// upgrade is wire-compatible.
+    #[serde(default = "default_tenant")]
+    pub tenant:     String,
 }
 
 // ─── Sequence types ───────────────────────────────────────────────────────────
@@ -135,11 +149,21 @@ impl RuntimeConfig {
 // ─── App state ────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
-struct AppState {
-    http_client:             reqwest::Client,
-    mode:                    Arc<RwLock<Mode>>,
-    mocks:                   Arc<RwLock<io::MockIndex>>,
-    unmatched:               Arc<RwLock<Vec<MockRequest>>>,
+pub(crate) struct AppState {
+    pub http_client:             reqwest::Client,
+    pub mode:                    Arc<RwLock<Mode>>,
+    /// Live mock library, swapped atomically on hot-reload.
+    ///
+    /// `arc_swap::ArcSwap<MockLibrary>` lets readers grab a snapshot in O(1)
+    /// without locking. The contract every handler obeys: call
+    /// `state.mocks.load_full()` ONCE at the top of the request and hold
+    /// the resulting `Arc<MockLibrary>` for the rest of the request
+    /// lifecycle. Subsequent reloads publish a new `Arc<MockLibrary>` —
+    /// the in-flight handler keeps using its snapshot. This guarantees
+    /// no torn reads, no half-applied edits, no panics from a writer that
+    /// shrinks the index out from under a reader.
+    pub mocks:                   Arc<io::MockStore>,
+    pub unmatched:               Arc<RwLock<Vec<MockRequest>>>,
     sequences:               Arc<RwLock<Vec<MockSequence>>>,
     sequence_counters:       Arc<RwLock<HashMap<String, u32>>>,
     runtime_config:          Arc<RwLock<RuntimeConfig>>,
@@ -674,11 +698,22 @@ async fn run_proxy() {
         })
         .unwrap_or(Mode::Learn);
 
-    let mocks     = io::load_all_service_mocks(&mock_dir).await;
+    let library   = io::load_all_service_mocks(&mock_dir).await;
     let sequences = io::load_sequences(&sequence_file_path).await;
-    let mock_count: usize = mocks.values().map(|m| m.len()).sum();
+    let mock_count = library.total_count();
+    let services   = library.service_count();
     info!("Loaded {} mocks ({} services), {} sequences — mode: {:?}",
-        mock_count, mocks.len(), sequences.len(), initial_mode);
+        mock_count, services, sequences.len(), initial_mode);
+
+    // ── Hot-reload watcher (v0.3, feature #6) ─────────────────────────────────
+    // The strategy is read once at boot from `MOCK_RELOAD_STRATEGY`. Default
+    // is `fs_watch`. The watcher publishes new `Arc<MockLibrary>` snapshots
+    // into `mocks_store` whenever the trigger fires. In-flight requests
+    // already holding the previous Arc keep using it until they finish.
+    let reload_strategy = io::ReloadStrategy::from_env();
+    info!("hot-reload strategy: {:?}", reload_strategy);
+    let mocks_store: Arc<io::MockStore> = Arc::new(arc_swap::ArcSwap::from_pointee(library));
+    io::start_watcher(reload_strategy, mock_dir.clone(), mocks_store.clone());
 
     // ── TODO(tls-spike) ────────────────────────────────────────────────────────
     // Current model: app → HTTP → proxy:8080 → HTTPS → real upstream (reqwest/rustls).
@@ -720,7 +755,7 @@ async fn run_proxy() {
     let state = AppState {
         http_client,
         mode:                    Arc::new(RwLock::new(initial_mode)),
-        mocks:                   Arc::new(RwLock::new(mocks)),
+        mocks:                   mocks_store,
         unmatched:               Arc::new(RwLock::new(Vec::new())),
         sequences:               Arc::new(RwLock::new(sequences)),
         sequence_counters:       Arc::new(RwLock::new(HashMap::new())),
@@ -754,8 +789,13 @@ async fn run_proxy() {
         // ── Mock library admin ──
         .route("/ghost/mode",      post(handle_set_mode))
         .route("/ghost/config",    post(handle_set_config))
-        .route("/ghost/mocks",     get(handle_list_mocks))
+        .route("/ghost/mocks",     get(handle_list_mocks).post(handle_create_mock))
         .route("/ghost/reload",    post(handle_reload_mocks))
+        // v0.3 hot-reload (feature #6) — explicit operator-driven reload
+        // for hosted/managed deployments where neither fs events nor SIGHUP
+        // is appropriate (`MOCK_RELOAD_STRATEGY=http_admin`). The route is
+        // always live regardless of the configured strategy.
+        .route("/ghost/admin/reload", post(handle_admin_reload))
         .route("/ghost/unmatched", get(handle_list_unmatched))
         // ── Sequence admin (v0.2.0+) ────────────────────────────────────
         // Sequences map a single endpoint to an ordered list of responses,
@@ -795,13 +835,10 @@ async fn run_proxy() {
 // ─── Health ───────────────────────────────────────────────────────────────────
 
 async fn handle_health(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let index     = state.mocks.read().await;
-    let mock_count: usize = index.values().map(|m| m.len()).sum();
-    let services  = index.len();
-    drop(index);
-    // Sequences are in-development; the data structure exists on
-    // AppState but the admin routes are not exposed publicly. Re-add
-    // `"sequences": <count>` here when the feature ships.
+    // Snapshot the live library — see ArcSwap docstring on `AppState.mocks`.
+    let library    = state.mocks.load_full();
+    let mock_count = library.total_count();
+    let services   = library.service_count();
     let mode = format!("{:?}", *state.mode.read().await);
     metrics::gauge!("ghost_mock_library_size").set(mock_count as f64);
     Json(serde_json::json!({
@@ -832,21 +869,87 @@ async fn handle_set_mode(
 
 // ─── Mock library ─────────────────────────────────────────────────────────────
 
-async fn handle_list_mocks(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let index = state.mocks.read().await;
-    let all: Vec<&MockEntry> = index.values().flat_map(|svc| svc.values()).collect();
+/// `GET /ghost/mocks` — list every mock in the live library, optionally
+/// scoped to a single tenant via `?tenant=...`. Tenant scoping (v0.3,
+/// feature #7) lets a CI worker introspect *its* mocks without seeing
+/// every other worker's library.
+async fn handle_list_mocks(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let library = state.mocks.load_full();
+    let tenant_filter = params.get("tenant").map(String::as_str);
+    let all = library.all_entries(tenant_filter);
     let count = all.len();
     Json(serde_json::json!({ "count": count, "mocks": all }))
 }
 
+/// `POST /ghost/reload` — operator-driven full reload (legacy alias for the
+/// v0.3 `POST /ghost/admin/reload`). Both routes call the same path.
 async fn handle_reload_mocks(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let index    = io::load_all_service_mocks(&state.mock_dir).await;
-    let count: usize   = index.values().map(|m| m.len()).sum();
-    let services = index.len();
-    *state.mocks.write().await = index;
-    metrics::gauge!("ghost_mock_library_size").set(count as f64);
+    let (count, services) = io::reload_full(&state.mock_dir, &state.mocks).await;
     info!("🔄 Reloaded {} mocks across {} services", count, services);
     Json(serde_json::json!({ "status": "ok", "loaded": count, "services": services }))
+}
+
+/// `POST /ghost/mocks` — operator-injected mock for tests / fixtures.
+///
+/// Accepts the full `MockEntry` JSON shape; missing fields take their serde
+/// defaults. In particular `tenant` defaults to `_global`, so existing
+/// tooling that doesn't know about per-test isolation (v0.3, feature #7)
+/// keeps working unchanged.
+///
+/// The new entry is published into the live library via ArcSwap. In-flight
+/// requests holding the previous Arc keep using it; new requests see the
+/// new entry. The mock is also appended to the per-service JSONL log so it
+/// survives a restart.
+async fn handle_create_mock(
+    State(state): State<AppState>,
+    Json(mut entry): Json<MockEntry>,
+) -> Json<serde_json::Value> {
+    if entry.tenant.is_empty() {
+        entry.tenant = GLOBAL_TENANT.to_string();
+    }
+    let svc_id = entry.service_id.clone().unwrap_or_else(|| GLOBAL_TENANT.to_string());
+    {
+        let current = state.mocks.load_full();
+        let mut next: io::MockLibrary = (*current).clone();
+        let segment = next.segments
+            .entry(svc_id.clone())
+            .or_insert_with(|| std::sync::Arc::new(io::MockSegment::default()));
+        let mut seg_owned = (**segment).clone();
+        let svc_map = seg_owned.services.entry(svc_id.clone()).or_default();
+        svc_map.insert(
+            (entry.request.method.clone(), entry.request.uri.clone(), entry.tenant.clone()),
+            entry.clone(),
+        );
+        *segment = std::sync::Arc::new(seg_owned);
+        state.mocks.store(std::sync::Arc::new(next));
+    }
+    let line = serde_json::to_string(&entry).unwrap_or_default();
+    let dir = state.mock_dir.clone();
+    let svc = svc_id.clone();
+    tokio::spawn(async move { io::append_to_mock_log(&dir, &svc, &line).await; });
+    info!("➕ mock added: {} {} (tenant={}, service={})",
+        entry.request.method, entry.request.uri, entry.tenant, svc_id);
+    Json(serde_json::json!({
+        "status":  "ok",
+        "id":      entry.id,
+        "tenant":  entry.tenant,
+        "service": svc_id,
+    }))
+}
+
+/// `POST /ghost/admin/reload` — explicit hot-reload trigger for hosted /
+/// managed deployments where neither fs events nor SIGHUP fit (v0.3,
+/// feature #6, `MOCK_RELOAD_STRATEGY=http_admin`). The route is always live
+/// regardless of the configured strategy so operators can force a reload
+/// even when a background watcher is also running.
+async fn handle_admin_reload(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let (count, services) = io::reload_full(&state.mock_dir, &state.mocks).await;
+    metrics::counter!("ghost_mock_reloads_total", "trigger" => "http_admin").increment(1);
+    info!("🔄 admin reload — loaded {} mocks across {} services", count, services);
+    Json(serde_json::json!({ "status": "ok", "loaded": count, "services": services, "trigger": "http_admin" }))
 }
 
 async fn handle_list_unmatched(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -1001,6 +1104,79 @@ fn fire_onboarding_event(
     }
 }
 
+// ─── Tenant resolution (per-test isolation, v0.3 feature #7) ────────────────
+//
+// Reads the tenant from the request headers (preferred) or the query string
+// (fallback). Defaults to `_global` when neither is present so every
+// existing client keeps working without changes.
+//
+// The header name is canonical-case-insensitive (HTTP spec) — `axum::HeaderMap`
+// already lowercases keys. The query parameter name is `_tenant` with the
+// underscore prefix to keep the namespace separate from any "tenant=" query
+// param a real upstream might use.
+//
+// Tenant strings are bounded at 128 chars to prevent runaway label
+// cardinality on the metric. Anything longer is truncated and tagged with
+// a counter for visibility.
+const MAX_TENANT_LEN: usize = 128;
+
+fn resolve_tenant(headers: &axum::http::HeaderMap, query: Option<&str>) -> String {
+    // 1. Header takes precedence.
+    if let Some(v) = headers.get("x-gostly-tenant").and_then(|v| v.to_str().ok()) {
+        return clamp_tenant(v);
+    }
+    // 2. Fallback: ?_tenant=foo
+    if let Some(q) = query {
+        for kv in q.split('&') {
+            let mut it = kv.splitn(2, '=');
+            if it.next() == Some("_tenant") {
+                if let Some(v) = it.next() {
+                    return clamp_tenant(v);
+                }
+            }
+        }
+    }
+    // 3. Default tenant.
+    GLOBAL_TENANT.to_string()
+}
+
+/// Drop any `_tenant=…` query param from the URI so it doesn't leak into
+/// the mock-library lookup key. Preserves all other query params and the
+/// path verbatim. Returns owned String only when the input contained the
+/// param (cheap path); otherwise re-uses the input as-is.
+fn strip_tenant_param(path_query: &str) -> String {
+    let q_pos = match path_query.find('?') {
+        Some(p) => p,
+        None    => return path_query.to_string(),
+    };
+    let (path, query) = path_query.split_at(q_pos);
+    let query = &query[1..]; // skip the '?'
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|kv| {
+            let key = kv.split('=').next().unwrap_or("");
+            key != "_tenant"
+        })
+        .collect();
+    if kept.is_empty() {
+        path.to_string()
+    } else {
+        format!("{}?{}", path, kept.join("&"))
+    }
+}
+
+fn clamp_tenant(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return GLOBAL_TENANT.to_string();
+    }
+    if trimmed.len() > MAX_TENANT_LEN {
+        metrics::counter!("ghost_tenant_truncated_total").increment(1);
+        return trimmed[..MAX_TENANT_LEN].to_string();
+    }
+    trimmed.to_string()
+}
+
 // ─── Core proxy handler ───────────────────────────────────────────────────────
 
 async fn proxy_handler(
@@ -1012,11 +1188,37 @@ async fn proxy_handler(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?.to_bytes();
 
     let method     = parts.method.to_string();
-    let path_query = matcher::normalize_uri(
-        parts.uri.path_and_query().map(|v| v.as_str()).unwrap_or("/")
-    );
+    // Strip the `_tenant=…` query param BEFORE normalising — the tenant is
+    // a routing concern, not part of the upstream contract. Leaving it in
+    // would corrupt the `(method, uri)` lookup key (a request for `/x?_tenant=foo`
+    // would never match a mock recorded as `/x`).
+    let raw_path_query = parts.uri.path_and_query().map(|v| v.as_str()).unwrap_or("/");
+    let path_query = matcher::normalize_uri(&strip_tenant_param(raw_path_query));
     let body_str    = String::from_utf8_lossy(&bytes).to_string();
     let global_mode = state.mode.read().await.clone();
+
+    // ── Mock library snapshot (in-flight safety, v0.3 feature #6) ─────────────
+    // Read the live library ONCE at the top of the handler. If a hot-reload
+    // fires while this request is in flight, the watcher publishes a new
+    // `Arc<MockLibrary>` via ArcSwap — but `library` (the snapshot we hold
+    // here) keeps pointing at the old library until this function returns
+    // and the Arc drops. Result: every request sees a single coherent
+    // version of the library across all match phases (exact → sequence →
+    // smart-swap), even under heavy reload pressure. Subsequent requests
+    // pick up the new snapshot from their own `load_full()` call.
+    let library = state.mocks.load_full();
+
+    // ── Tenant resolution (per-test isolation, v0.3 feature #7) ──────────────
+    // Resolution order, first-match wins:
+    //   1. `X-Gostly-Tenant: foo` request header   ← preferred
+    //   2. `?_tenant=foo` query string parameter   ← fallback for clients
+    //                                                that can't set headers
+    //   3. `_global` default                       ← shared library across
+    //                                                all unscoped requests
+    // Tenant scoping is enforced inside the per-service mock map: the
+    // index key is `(method, uri, tenant)`, so a request for tenant
+    // `worker-3` cannot see entries written under any other tenant.
+    let tenant = resolve_tenant(&parts.headers, parts.uri.query());
 
     // Resolve which upstream to proxy to (multi-stream routing)
     let host = parts.headers.get("host")
@@ -1147,27 +1349,34 @@ async fn proxy_handler(
     match mode {
         // ── MOCK ──────────────────────────────────────────────────────────────
         Mode::Mock => {
-            // 1. Exact match — O(1) per-service HashMap lookup
+            // 1. Exact match — O(1) lookup against the snapshotted library.
+            //
+            // We use the `library` Arc snapshotted at the top of the handler;
+            // a hot-reload publishing a new library while this branch runs
+            // does not perturb the lookup. Tenant-scoped: only entries
+            // written under the resolved tenant are visible.
             {
-                let index   = state.mocks.read().await;
-                let svc_key = resolved_service_id.as_deref().unwrap_or("_global");
-                let entry   = index.get(svc_key)
-                    .and_then(|svc| matcher::find_exact(svc, &method, &path_query, &body_str));
-                drop(index);
-                if let Some(entry) = entry {
-                    info!("🎭 EXACT HIT  {} {}", method, path_query);
-                    metrics::counter!("ghost_requests_total", "match_type" => "exact").increment(1);
-                    fire_onboarding_event(
-                        &state,
-                        "first_mock_served",
-                        resolved_service_id.as_deref(),
-                        &state.onboarding_served,
-                    );
-                    return serve_mock_response(
-                        entry.response.status, entry.response.headers,
-                        entry.response.body.into_bytes(), entry.response.latency_ms,
-                        "X-Ghost-Mock", "true",
-                    ).await;
+                let svc_key = resolved_service_id.as_deref().unwrap_or(GLOBAL_TENANT);
+                if let Some(entry) = library.find_exact(svc_key, &method, &path_query, &tenant) {
+                    if entry.request.body == body_str {
+                        info!("🎭 EXACT HIT  {} {} (tenant={})", method, path_query, tenant);
+                        metrics::counter!(
+                            "ghost_requests_total",
+                            "match_type" => "exact",
+                            "tenant"     => tenant.clone(),
+                        ).increment(1);
+                        fire_onboarding_event(
+                            &state,
+                            "first_mock_served",
+                            resolved_service_id.as_deref(),
+                            &state.onboarding_served,
+                        );
+                        return serve_mock_response(
+                            entry.response.status, entry.response.headers,
+                            entry.response.body.into_bytes(), entry.response.latency_ms,
+                            "X-Ghost-Mock", "true",
+                        ).await;
+                    }
                 }
             }
 
@@ -1198,14 +1407,12 @@ async fn proxy_handler(
             // Inference-assisted structural match and generative gap-fill
             // live in the hosted Gostly product (https://gostly.ai); they
             // are not part of this binary.
+            //
+            // Smart-swap is also tenant-scoped: only entries written under
+            // the resolved tenant are candidates.
             if state.smart_swap_enabled {
-                let svc_entries: Vec<MockEntry> = {
-                    let index   = state.mocks.read().await;
-                    let svc_key = resolved_service_id.as_deref().unwrap_or("_global");
-                    index.get(svc_key)
-                        .map(|svc| svc.values().cloned().collect())
-                        .unwrap_or_default()
-                };
+                let svc_key = resolved_service_id.as_deref().unwrap_or(GLOBAL_TENANT);
+                let svc_entries = library.entries_for_service(svc_key, Some(&tenant));
                 if let Some(entry) = matcher::find_smart_swap(&svc_entries, &method, &path_query, &body_str) {
                     info!("🔀 SWAP HIT   {} {}", method, path_query);
                     metrics::counter!("ghost_requests_total", "match_type" => "smart_swap").increment(1);
@@ -1307,6 +1514,11 @@ async fn proxy_handler(
                     body: res_body_str, latency_ms,
                 },
                 service_id: resolved_service_id.clone(),
+                // Recorded mocks inherit the tenant from the request that
+                // produced them. Backwards-compat: requests without a tenant
+                // header land under `_global` so existing recordings stay
+                // readable to existing tests.
+                tenant: tenant.clone(),
             };
 
             info!("📼 RECORDED {} {} → {} ({}ms)", method, path_query, res_status, latency_ms);
@@ -1353,19 +1565,34 @@ async fn proxy_handler(
                 tokio::spawn(async move { io::append_to_traffic_log(&dir, &svc, &line).await; });
             }
 
-            // ── Serving index (per-service, deduplicated by method+uri) ─────────
-            // HashMap keyed by (method, uri) — insert always overwrites the previous
-            // entry for the same endpoint, keeping the index bounded and current.
+            // ── Serving index (per-segment, deduplicated by method+uri+tenant) ──
+            //
+            // The index is keyed by (method, uri, tenant) — insert always
+            // overwrites the previous entry for the same triple, keeping the
+            // segment bounded and current.
             //
             // Separation from the traffic log follows CQRS/event-sourcing:
             //   • Traffic log  = event store (full history, per-service, never mutated)
-            //   • Serving index = materialized view (per-service HashMap, always current)
+            //   • Serving index = materialized view (per-segment HashMap, always current)
+            //
+            // ArcSwap publishes the new library atomically: any other request
+            // already holding the previous Arc keeps its snapshot intact.
             {
-                let svc_id = resolved_service_id.as_deref().unwrap_or("_global").to_string();
+                let svc_id = resolved_service_id.as_deref().unwrap_or(GLOBAL_TENANT).to_string();
                 {
-                    let mut index = state.mocks.write().await;
-                    let svc = index.entry(svc_id.clone()).or_default();
-                    svc.insert((entry.request.method.clone(), entry.request.uri.clone()), entry.clone());
+                    let current = state.mocks.load_full();
+                    let mut next: io::MockLibrary = (*current).clone();
+                    let segment = next.segments
+                        .entry(svc_id.clone())
+                        .or_insert_with(|| std::sync::Arc::new(io::MockSegment::default()));
+                    let mut seg_owned = (**segment).clone();
+                    let svc_map = seg_owned.services.entry(svc_id.clone()).or_default();
+                    svc_map.insert(
+                        (entry.request.method.clone(), entry.request.uri.clone(), entry.tenant.clone()),
+                        entry.clone(),
+                    );
+                    *segment = std::sync::Arc::new(seg_owned);
+                    state.mocks.store(std::sync::Arc::new(next));
                 }
                 let line = serde_json::to_string(&entry).unwrap_or_default();
                 let dir = state.mock_dir.clone();
