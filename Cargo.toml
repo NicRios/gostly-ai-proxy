@@ -38,6 +38,18 @@ uuid = { version = "1", features = ["v4"] }
 rand = "0.8"
 parking_lot = "0.12"
 
+# Hot-reload (v0.3): cross-platform fs watcher (inotify / FSEvents / ReadDirectoryChangesW)
+# + lock-free Arc swapping so in-flight requests keep the snapshot they started with.
+notify = "6.1"
+arc-swap = "1"
+
+# SIGHUP-driven reload (v0.3) — tokio-friendly stream of POSIX signals.
+# Optional path: `MOCK_RELOAD_STRATEGY=signal` for k8s/Docker setups where
+# fs events on shared volumes are unreliable.
+signal-hook = "0.3"
+signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"] }
+futures = "0.3"
+
 # CLI parser. The default `gostly` invocation with no subcommand boots the
 # proxy; subcommands are short HTTP clients to a running proxy. `derive`
 # is required for the #[derive(Parser)] / #[derive(Subcommand)] macros and

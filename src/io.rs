@@ -1,58 +1,235 @@
 use std::collections::HashMap;
-use crate::{MockEntry, MockSequence, Mode};
+use std::sync::Arc;
+use crate::{MockEntry, MockSequence, Mode, GLOBAL_TENANT};
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 
-/// Per-service mock map: (method, uri) → MockEntry. O(1) exact lookup.
-pub type ServiceMocks = HashMap<(String, String), MockEntry>;
-/// Full mock index keyed by service_id → ServiceMocks.
-/// The sentinel service_id "_global" holds manually created mocks with no service assignment.
-pub type MockIndex = HashMap<String, ServiceMocks>;
+/// Tenant key for per-test isolation (v0.3, feature #7). Backwards-compat
+/// JSONL files without a tenant field deserialize to `_global`. Requests
+/// without `X-Gostly-Tenant` (or `?_tenant=`) read `_global`.
+pub type Tenant = String;
 
-/// Load all per-service mock files from `dir`.
-/// Reads every file matching `mock_{svc_id}.jsonl`. Skips missing/unreadable files silently.
-pub async fn load_all_service_mocks(dir: &str) -> MockIndex {
-    let mut index = MockIndex::new();
+/// Per-service mock map: (method, uri, tenant) → MockEntry. O(1) exact lookup.
+///
+/// Tenant scoping (v0.3, feature #7) is part of the key so a single library
+/// can hold mocks for many parallel test workers without cross-pollination.
+/// A request under tenant `worker-3` will only ever match entries written
+/// under tenant `worker-3`; the default tenant is `_global`.
+pub type ServiceMocks = HashMap<(String, String, Tenant), MockEntry>;
+
+/// One mock file → one immutable `MockSegment`. Hot-reload (v0.3, feature #6)
+/// rebuilds only the changed file's segment, leaving the others untouched, so
+/// editing `mock_users.jsonl` doesn't perturb the in-memory state for
+/// `mock_orders.jsonl`. The segment is wrapped in an `Arc` and swapped out
+/// atomically via `MockLibrary` (which is itself wrapped in an `arc_swap::ArcSwap`).
+#[derive(Default, Debug, Clone)]
+pub struct MockSegment {
+    /// service_id → ServiceMocks
+    /// In v0.3 the file naming scheme is still `mock_{service_id}.jsonl`, so
+    /// each segment only contributes one service. The map keeps the same
+    /// shape as `MockIndex` so callers (matcher, handlers) don't need a
+    /// separate code path for "single-service-segment" lookups.
+    pub services: HashMap<String, ServiceMocks>,
+}
+
+/// Full mock library: a tree of per-file segments keyed by file basename
+/// (the `{svc_id}` part of `mock_{svc_id}.jsonl`). Segments are
+/// `Arc<MockSegment>` so the watcher can swap one out without rebuilding
+/// the others, and so a request handler can read a segment once and hold
+/// the Arc through processing.
+///
+/// The library itself lives behind an `arc_swap::ArcSwap` (see `AppState`)
+/// for in-flight request safety: the handler reads `state.mocks` ONCE at
+/// the top of the request and holds the resulting `Arc<MockLibrary>` for
+/// the entire lifecycle. Subsequent reloads publish a new `Arc<MockLibrary>`
+/// — the in-flight handler still sees the old one. This is the same pattern
+/// rustls uses for its `ConfigBuilder`: lock-free reads, atomic swaps.
+#[derive(Default, Debug, Clone)]
+pub struct MockLibrary {
+    /// Segment basename (e.g. "users" for `mock_users.jsonl`) → Arc<MockSegment>.
+    /// The `_global` synthetic key holds entries injected via `POST /ghost/mocks`
+    /// at runtime; it has no on-disk file.
+    pub segments: HashMap<String, Arc<MockSegment>>,
+}
+
+impl MockLibrary {
+    pub fn new() -> Self { Self::default() }
+
+    /// Total mock count across every segment. O(segments + services).
+    pub fn total_count(&self) -> usize {
+        self.segments
+            .values()
+            .map(|seg| seg.services.values().map(|m| m.len()).sum::<usize>())
+            .sum()
+    }
+
+    /// Number of distinct service_ids across every segment. O(segments + services).
+    pub fn service_count(&self) -> usize {
+        let mut svcs: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for seg in self.segments.values() {
+            for k in seg.services.keys() { svcs.insert(k.as_str()); }
+        }
+        svcs.len()
+    }
+
+    /// Look up a single (method, uri, tenant) entry across all segments.
+    /// Returns the first matching `MockEntry` found in any segment that
+    /// contains the requested service_id. The `_global` tenant fallback is
+    /// the responsibility of the caller (handler) — this function is
+    /// strictly tenant-scoped so accidental cross-pollution is impossible.
+    pub fn find_exact(
+        &self,
+        service_id: &str,
+        method: &str,
+        uri: &str,
+        tenant: &str,
+    ) -> Option<MockEntry> {
+        let key = (method.to_string(), uri.to_string(), tenant.to_string());
+        for seg in self.segments.values() {
+            if let Some(svc) = seg.services.get(service_id) {
+                if let Some(entry) = svc.get(&key) {
+                    return Some(entry.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// Collect every entry for `service_id` across every segment, optionally
+    /// filtered by tenant. Used by smart-swap fallback which needs the full
+    /// per-service corpus.
+    pub fn entries_for_service(
+        &self,
+        service_id: &str,
+        tenant: Option<&str>,
+    ) -> Vec<MockEntry> {
+        let mut out = Vec::new();
+        for seg in self.segments.values() {
+            if let Some(svc) = seg.services.get(service_id) {
+                for ((_, _, t), e) in svc.iter() {
+                    if tenant.is_none_or(|want| want == t) {
+                        out.push(e.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Flatten every entry across every segment (used by `GET /ghost/mocks`,
+    /// optionally tenant-scoped).
+    pub fn all_entries(&self, tenant: Option<&str>) -> Vec<MockEntry> {
+        let mut out = Vec::new();
+        for seg in self.segments.values() {
+            for svc in seg.services.values() {
+                for ((_, _, t), e) in svc.iter() {
+                    if tenant.is_none_or(|want| want == t) {
+                        out.push(e.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Backwards-compat alias: a few call sites + tests still spell the old name.
+/// New code should use `MockLibrary` directly.
+#[allow(dead_code)]
+pub type MockIndex = MockLibrary;
+
+/// Build a single segment from one JSONL file. Returns `None` if the file
+/// has no parseable entries (matches the old per-file behaviour where
+/// services with no parseable lines are dropped from the index entirely).
+async fn load_one_segment(path: &std::path::Path) -> Option<(String, MockSegment)> {
+    let fname = path.file_name().and_then(|n| n.to_str())?.to_string();
+    if !fname.starts_with("mock_") || !fname.ends_with(".jsonl") {
+        return None;
+    }
+    let svc_id = fname["mock_".len()..fname.len() - ".jsonl".len()].to_string();
+    let content = tokio::fs::read_to_string(path).await.ok()?;
+
+    let mut svc_mocks: ServiceMocks = HashMap::new();
+    for line in content.lines() {
+        if let Ok(entry) = serde_json::from_str::<MockEntry>(line) {
+            // Tenant defaults to "_global" when missing on disk (serde default).
+            let tenant = entry.tenant.clone();
+            svc_mocks.insert(
+                (entry.request.method.clone(), entry.request.uri.clone(), tenant),
+                entry,
+            );
+        }
+    }
+    if svc_mocks.is_empty() {
+        return None;
+    }
+
+    // Compact: rewrite file with one line per unique (method, uri, tenant) so
+    // the append log doesn't grow unboundedly between restarts.
+    let tmp = format!("{}.tmp", path.display());
+    let compacted = svc_mocks.values()
+        .filter_map(|m| serde_json::to_string(m).ok())
+        .collect::<Vec<_>>()
+        .join("\n") + "\n";
+    if tokio::fs::write(&tmp, &compacted).await.is_ok() {
+        let _ = tokio::fs::rename(&tmp, path).await;
+    }
+
+    let mut services = HashMap::new();
+    services.insert(svc_id.clone(), svc_mocks);
+    Some((svc_id, MockSegment { services }))
+}
+
+/// Load all per-service mock files from `dir` into a fresh `MockLibrary`.
+/// Reads every file matching `mock_{svc_id}.jsonl`. Skips missing/unreadable
+/// files silently. Each file becomes its own `Arc<MockSegment>` so subsequent
+/// reloads can rebuild segments individually (see `reload_segment`).
+pub async fn load_all_service_mocks(dir: &str) -> MockLibrary {
+    let mut library = MockLibrary::new();
     let mut rd = match tokio::fs::read_dir(dir).await {
         Ok(r)  => r,
-        Err(_) => return index,
+        Err(_) => return library,
     };
     while let Ok(Some(de)) = rd.next_entry().await {
         let path = de.path();
-        let fname = match path.file_name().and_then(|n| n.to_str()) {
-            Some(n) => n.to_string(),
-            None    => continue,
-        };
-        if !fname.starts_with("mock_") || !fname.ends_with(".jsonl") {
-            continue;
+        if let Some((svc_id, segment)) = load_one_segment(&path).await {
+            library.segments.insert(svc_id, Arc::new(segment));
         }
-        let svc_id = fname["mock_".len()..fname.len() - ".jsonl".len()].to_string();
-        let content = match tokio::fs::read_to_string(&path).await {
-            Ok(c)  => c,
-            Err(_) => continue,
-        };
-        // Last line wins per (method, uri) — HashMap collect naturally deduplicates.
-        let svc_mocks: ServiceMocks = content
-            .lines()
-            .filter_map(|l| serde_json::from_str::<MockEntry>(l).ok())
-            .map(|e| ((e.request.method.clone(), e.request.uri.clone()), e))
-            .collect();
-        if svc_mocks.is_empty() {
-            continue;
-        }
-        // Compact: rewrite file with one line per unique endpoint so the
-        // append log doesn't grow unboundedly between restarts.
-        let tmp = format!("{}.tmp", path.display());
-        let compacted = svc_mocks.values()
-            .filter_map(|m| serde_json::to_string(m).ok())
-            .collect::<Vec<_>>()
-            .join("\n") + "\n";
-        if tokio::fs::write(&tmp, &compacted).await.is_ok() {
-            let _ = tokio::fs::rename(&tmp, &path).await;
-        }
-        index.insert(svc_id, svc_mocks);
     }
-    index
+    library
+}
+
+/// Reload a single file into a new `Arc<MockSegment>` and return it. The
+/// caller publishes the segment by cloning the current `MockLibrary`,
+/// inserting the new segment, and `store`-ing the rebuilt library back into
+/// the `ArcSwap`. Returns `None` if the file is gone or has no parseable
+/// entries — caller decides whether to drop the segment from the library.
+pub async fn reload_segment(path: &std::path::Path) -> Option<(String, Arc<MockSegment>)> {
+    load_one_segment(path).await.map(|(svc, seg)| (svc, Arc::new(seg)))
+}
+
+/// Build a `MockLibrary` from a single in-memory list of entries (used by
+/// admin POSTs which create mocks without touching disk). The synthetic
+/// segment basename is `_global` so admin-created entries don't collide
+/// with file-backed segments.
+#[allow(dead_code)]
+pub fn library_from_entries(entries: Vec<MockEntry>) -> MockLibrary {
+    let mut svc_map: HashMap<String, ServiceMocks> = HashMap::new();
+    for entry in entries {
+        let svc = entry.service_id.clone().unwrap_or_else(|| GLOBAL_TENANT.to_string());
+        let key = (
+            entry.request.method.clone(),
+            entry.request.uri.clone(),
+            entry.tenant.clone(),
+        );
+        svc_map.entry(svc).or_default().insert(key, entry);
+    }
+    let mut library = MockLibrary::new();
+    library.segments.insert(
+        GLOBAL_TENANT.to_string(),
+        Arc::new(MockSegment { services: svc_map }),
+    );
+    library
 }
 
 /// Append a single serialised MockEntry to the per-service serving index log.
@@ -170,6 +347,240 @@ pub async fn write_mode_to_file(path: &str, mode: &Mode) {
     }
 }
 
+// ─── Hot-reload watcher (v0.3, feature #6) ────────────────────────────────────
+//
+// `MOCK_RELOAD_STRATEGY` selects the trigger source. Default is `fs_watch`
+// (the `notify` crate; inotify on Linux, FSEvents on macOS,
+// ReadDirectoryChangesW on Windows). Other strategies suit environments
+// where filesystem events are unreliable or unsupported:
+//
+// - `fs_watch`  — default for local dev. Editor saves trigger reload.
+// - `signal`    — SIGHUP. Useful in k8s/Docker with shared volumes where
+//                 inotify on a bind-mount or PVC is flaky.
+// - `poll`      — fixed-interval rescan. Fallback for NFS / EFS / GCS-FUSE
+//                 where neither inotify nor SIGHUP is reliable.
+// - `http_admin`— operator-driven via `POST /ghost/admin/reload`. The route
+//                 is always live; this strategy just stops the watcher from
+//                 starting any background task.
+//
+// In-flight semantics: the watcher publishes a *new* `Arc<MockLibrary>` via
+// `ArcSwap::store`. Existing handlers keep their old Arc until they finish.
+// The handler's contract is to call `state.mocks.load()` ONCE per request
+// at the top of `proxy_handler` and use that snapshot for the rest of the
+// request lifecycle. This is the same pattern rustls uses for its
+// `ConfigBuilder`: lock-free reads, atomic publishes, no torn views.
+
+/// How a `MockLibraryWatcher` decides when to reload the on-disk library.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReloadStrategy {
+    /// `notify` crate — inotify / FSEvents / ReadDirectoryChangesW.
+    /// 200ms debounce coalesces editor-save bursts.
+    FsWatch,
+    /// SIGHUP from the operator (or k8s `kubectl exec ... kill -HUP`).
+    Signal,
+    /// Fixed-interval rescan. The duration is read from `MOCK_RELOAD_POLL_MS`
+    /// (default 30s).
+    Poll,
+    /// No background task; `POST /ghost/admin/reload` is the only trigger.
+    HttpAdmin,
+}
+
+impl ReloadStrategy {
+    pub fn from_env() -> Self {
+        match std::env::var("MOCK_RELOAD_STRATEGY").ok().as_deref() {
+            Some("signal")     => ReloadStrategy::Signal,
+            Some("poll")       => ReloadStrategy::Poll,
+            Some("http_admin") => ReloadStrategy::HttpAdmin,
+            // Empty / unset / any other value → default to fs_watch.
+            _                  => ReloadStrategy::FsWatch,
+        }
+    }
+}
+
+/// Atomic, in-flight-safe handle to the live mock library.
+///
+/// `arc_swap::ArcSwap` lets readers grab the current `Arc<MockLibrary>` in
+/// O(1) without locking. The watcher publishes a new `Arc<MockLibrary>` by
+/// calling `store(...)`; in-flight handlers that already loaded the old Arc
+/// keep using it until they drop the reference. New requests see the new
+/// snapshot from their next `load()` call.
+pub type MockStore = arc_swap::ArcSwap<MockLibrary>;
+
+/// Performs a full reload of `dir` and publishes the result via `store`.
+/// Returns the new (count, services) tuple for logging.
+///
+/// This is the single shared reload path used by every strategy. Per-file
+/// segment rebuilds are handled by `reload_one_file`; this version
+/// rebuilds the whole library from scratch (used on startup and by
+/// poll / signal / http_admin paths which don't know which specific file
+/// changed).
+pub async fn reload_full(dir: &str, store: &MockStore) -> (usize, usize) {
+    let library = load_all_service_mocks(dir).await;
+    let count    = library.total_count();
+    let services = library.service_count();
+    store.store(Arc::new(library));
+    metrics::gauge!("ghost_mock_library_size").set(count as f64);
+    metrics::counter!("ghost_mock_reloads_total", "trigger" => "full").increment(1);
+    (count, services)
+}
+
+/// Per-file segment rebuild for the `fs_watch` strategy. Looks at one
+/// changed file path, rebuilds its segment, and publishes a new
+/// `Arc<MockLibrary>` with that segment swapped in (or removed if the file
+/// is now gone or empty).
+pub async fn reload_one_file(path: &std::path::Path, store: &MockStore) {
+    let fname = match path.file_name().and_then(|n| n.to_str()) {
+        Some(n) => n.to_string(),
+        None    => return,
+    };
+    if !fname.starts_with("mock_") || !fname.ends_with(".jsonl") {
+        return;
+    }
+    let svc_id = fname["mock_".len()..fname.len() - ".jsonl".len()].to_string();
+
+    // Snapshot the current library, swap in the rebuilt (or removed) segment.
+    let current = store.load_full();
+    let mut next: MockLibrary = (*current).clone();
+    match reload_segment(path).await {
+        Some((_, segment)) => { next.segments.insert(svc_id.clone(), segment); }
+        None               => { next.segments.remove(&svc_id); }
+    }
+    let count = next.total_count();
+    store.store(Arc::new(next));
+    metrics::gauge!("ghost_mock_library_size").set(count as f64);
+    metrics::counter!("ghost_mock_reloads_total", "trigger" => "fs_watch").increment(1);
+    tracing::info!(segment = %svc_id, total_mocks = count, "🔄 hot-reload: segment rebuilt");
+}
+
+/// Background task that turns reload triggers into `MockStore` publishes.
+///
+/// Returns immediately for `HttpAdmin` (the route handler does the work).
+/// For the active strategies, spawns a tokio task that runs for the lifetime
+/// of the process. The handle is intentionally fire-and-forget — the watcher
+/// outlives the function call and is killed by the runtime on shutdown.
+pub fn start_watcher(strategy: ReloadStrategy, mock_dir: String, store: Arc<MockStore>) {
+    match strategy {
+        ReloadStrategy::FsWatch  => spawn_fs_watch(mock_dir, store),
+        ReloadStrategy::Signal   => spawn_signal_watch(mock_dir, store),
+        ReloadStrategy::Poll     => spawn_poll_watch(mock_dir, store),
+        ReloadStrategy::HttpAdmin => {
+            tracing::info!("hot-reload strategy: http_admin (POST /ghost/admin/reload to trigger)");
+        }
+    }
+}
+
+fn spawn_fs_watch(mock_dir: String, store: Arc<MockStore>) {
+    use notify::{RecursiveMode, Watcher, EventKind};
+    tracing::info!(mock_dir = %mock_dir, "hot-reload strategy: fs_watch (notify; 200ms debounce)");
+
+    // Sync mpsc — `notify` callbacks are sync. We forward into a tokio task
+    // through a tokio mpsc on the receive side.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<std::path::PathBuf>();
+
+    tokio::spawn(async move {
+        // Hold the watcher in this task so it lives as long as the channel.
+        let watcher_tx = tx.clone();
+        let mut watcher = match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            if let Ok(event) = res {
+                // Only react to mutations that change file contents — Create,
+                // Modify, Remove. The Access/Other events are noise.
+                if !matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)) {
+                    return;
+                }
+                for path in event.paths {
+                    let _ = watcher_tx.send(path);
+                }
+            }
+        }) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::error!(error = %e, "fs_watch failed to start; falling back to manual reload only");
+                return;
+            }
+        };
+        // The dir may not exist yet at boot — create it then watch.
+        let _ = tokio::fs::create_dir_all(&mock_dir).await;
+        if let Err(e) = watcher.watch(std::path::Path::new(&mock_dir), RecursiveMode::NonRecursive) {
+            tracing::error!(mock_dir = %mock_dir, error = %e, "fs_watch could not bind to mock_dir");
+            return;
+        }
+
+        // Debounce loop — coalesce bursts of events (editors typically
+        // write a tmp file then rename, producing 2-3 events per save).
+        let debounce = std::time::Duration::from_millis(200);
+        loop {
+            // Block for the first event.
+            let path = match rx.recv().await {
+                Some(p) => p,
+                None    => break, // channel closed → watcher dropped
+            };
+            let mut pending: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
+            pending.insert(path);
+
+            // Drain any further events that arrive within the debounce window.
+            let drain = tokio::time::sleep(debounce);
+            tokio::pin!(drain);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut drain => break,
+                    next = rx.recv() => match next {
+                        Some(p) => { pending.insert(p); },
+                        None    => break,
+                    }
+                }
+            }
+
+            for p in pending {
+                reload_one_file(&p, &store).await;
+            }
+        }
+    });
+}
+
+#[cfg(unix)]
+fn spawn_signal_watch(mock_dir: String, store: Arc<MockStore>) {
+    use signal_hook::consts::SIGHUP;
+    use signal_hook_tokio::Signals;
+    use futures::stream::StreamExt;
+    tracing::info!(mock_dir = %mock_dir, "hot-reload strategy: signal (SIGHUP)");
+    tokio::spawn(async move {
+        let mut signals = match Signals::new([SIGHUP]) {
+            Ok(s)  => s,
+            Err(e) => {
+                tracing::error!(error = %e, "signal watcher failed to register SIGHUP");
+                return;
+            }
+        };
+        while signals.next().await.is_some() {
+            let (count, services) = reload_full(&mock_dir, &store).await;
+            tracing::info!(count, services, "🔄 SIGHUP reload");
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn spawn_signal_watch(_mock_dir: String, _store: Arc<MockStore>) {
+    tracing::warn!("signal-based reload requires Unix; ignoring MOCK_RELOAD_STRATEGY=signal");
+}
+
+fn spawn_poll_watch(mock_dir: String, store: Arc<MockStore>) {
+    let interval_ms = std::env::var("MOCK_RELOAD_POLL_MS")
+        .ok().and_then(|v| v.parse().ok())
+        .unwrap_or(30_000_u64);
+    tracing::info!(mock_dir = %mock_dir, interval_ms, "hot-reload strategy: poll");
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(interval_ms));
+        // First tick fires immediately; skip it so we don't double-reload at boot.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let (count, services) = reload_full(&mock_dir, &store).await;
+            tracing::debug!(count, services, "poll reload");
+        }
+    });
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -226,19 +637,29 @@ mod tests {
         )
     }
 
-    // ── load_all_service_mocks ────────────────────────────────────────────────
+    // ── load_all_service_mocks (now segmented) ────────────────────────────────
+    //
+    // The library is a tree of `Arc<MockSegment>` keyed by file basename.
+    // Each segment contains a `services: HashMap<String, ServiceMocks>` —
+    // ServiceMocks is keyed by (method, uri, tenant). The tests below assert
+    // both load behaviour AND segment shape so future refactors don't
+    // silently flatten the tree.
+
+    fn segment_for(library: &MockLibrary, svc: &str) -> Option<Arc<MockSegment>> {
+        library.segments.get(svc).cloned()
+    }
 
     #[tokio::test]
     async fn load_all_service_mocks_missing_dir_returns_empty() {
-        let idx = load_all_service_mocks("/tmp/gostly-io-test-does-not-exist-123456").await;
-        assert!(idx.is_empty(), "missing dir must return empty index, not panic");
+        let lib = load_all_service_mocks("/tmp/gostly-io-test-does-not-exist-123456").await;
+        assert!(lib.segments.is_empty(), "missing dir must return empty library, not panic");
     }
 
     #[tokio::test]
     async fn load_all_service_mocks_empty_dir_returns_empty() {
         let dir = unique_dir("emptydir");
-        let idx = load_all_service_mocks(&dir).await;
-        assert!(idx.is_empty(), "empty dir must yield empty index");
+        let lib = load_all_service_mocks(&dir).await;
+        assert!(lib.segments.is_empty(), "empty dir must yield empty library");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -255,10 +676,11 @@ mod tests {
         // File with .jsonl ext but wrong prefix — must be ignored
         tokio::fs::write(format!("{}/traffic_other.jsonl", dir), "noise").await.unwrap();
 
-        let idx = load_all_service_mocks(&dir).await;
-        assert_eq!(idx.len(), 1, "exactly one service expected, got {:?}", idx.keys().collect::<Vec<_>>());
-        let svc = idx.get("svc-a").expect("svc-a missing");
-        assert!(svc.contains_key(&("GET".to_string(), "/users".to_string())));
+        let lib = load_all_service_mocks(&dir).await;
+        assert_eq!(lib.segments.len(), 1, "exactly one segment expected, got {:?}", lib.segments.keys().collect::<Vec<_>>());
+        let seg = segment_for(&lib, "svc-a").expect("svc-a segment missing");
+        let svc = seg.services.get("svc-a").expect("svc-a service map missing");
+        assert!(svc.contains_key(&("GET".to_string(), "/users".to_string(), GLOBAL_TENANT.to_string())));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -268,7 +690,7 @@ mod tests {
         // Two entries for the same (GET, /users); HashMap keeps one. The exact
         // winner is implementation-defined since serde_json::from_str + collect
         // doesn't guarantee order — the load contract is "exactly one entry
-        // per (method, uri)" which is what we assert.
+        // per (method, uri, tenant)" which is what we assert.
         let body = format!(
             "{}\n{}\n",
             entry_line("first", "GET", "/users"),
@@ -276,11 +698,12 @@ mod tests {
         );
         tokio::fs::write(format!("{}/mock_svc.jsonl", dir), body).await.unwrap();
 
-        let idx = load_all_service_mocks(&dir).await;
-        let svc = idx.get("svc").expect("svc missing");
+        let lib = load_all_service_mocks(&dir).await;
+        let seg = segment_for(&lib, "svc").expect("svc segment missing");
+        let svc = seg.services.get("svc").expect("svc service map missing");
         assert_eq!(
             svc.len(), 1,
-            "duplicates must collapse to a single entry per (method, uri)"
+            "duplicates must collapse to a single entry per (method, uri, tenant)"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -295,8 +718,9 @@ mod tests {
         );
         tokio::fs::write(format!("{}/mock_svc.jsonl", dir), body).await.unwrap();
 
-        let idx = load_all_service_mocks(&dir).await;
-        let svc = idx.get("svc").expect("svc missing");
+        let lib = load_all_service_mocks(&dir).await;
+        let seg = segment_for(&lib, "svc").expect("svc segment missing");
+        let svc = seg.services.get("svc").expect("svc service map missing");
         assert_eq!(svc.len(), 2, "malformed lines must be silently skipped");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -304,13 +728,13 @@ mod tests {
     #[tokio::test]
     async fn load_all_service_mocks_skips_files_with_only_invalid_lines() {
         let dir = unique_dir("allinvalid");
-        // File parses to zero entries → not inserted into the index at all.
+        // File parses to zero entries → not inserted into the library at all.
         tokio::fs::write(
             format!("{}/mock_svc.jsonl", dir),
             "garbage\nmore-garbage\n",
         ).await.unwrap();
-        let idx = load_all_service_mocks(&dir).await;
-        assert!(idx.is_empty(), "service with no parseable entries must be omitted");
+        let lib = load_all_service_mocks(&dir).await;
+        assert!(lib.segments.is_empty(), "service with no parseable entries must be omitted");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

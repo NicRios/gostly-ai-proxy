@@ -113,6 +113,67 @@ independently.
 
 ---
 
+## Hot-reload model (v0.3)
+
+The mock library is a tree of per-file `Arc<MockSegment>` segments. Each
+file `data/mocks/mock_<svc>.jsonl` becomes one segment; segments are
+keyed by file basename so a reload can rebuild the changed file's
+segment alone, leaving the rest untouched.
+
+The whole library lives behind an `arc_swap::ArcSwap<MockLibrary>` —
+readers grab the current `Arc<MockLibrary>` in O(1) without locking,
+writers publish a new library by calling `store(...)`. The proxy handler
+contract is:
+
+> Call `state.mocks.load_full()` ONCE at the top of the request. Hold
+> the resulting `Arc<MockLibrary>` for the entire request lifecycle.
+
+In-flight requests already holding the previous Arc keep using it until
+they finish. New requests see the new snapshot on their next
+`load_full()`. This is the same pattern rustls uses for its
+`ConfigBuilder`: lock-free reads, atomic publishes, no torn views, no
+panics from a writer that shrinks the index out from under a reader.
+
+`MOCK_RELOAD_STRATEGY` selects the trigger source:
+
+| Strategy     | Mechanism                                                       |
+|--------------|-----------------------------------------------------------------|
+| `fs_watch`   | `notify` crate (inotify / FSEvents / ReadDirectoryChangesW), 200 ms debounce, per-file segment rebuild |
+| `signal`     | `signal-hook-tokio` listens for SIGHUP, full library reload     |
+| `poll`       | `tokio::time::interval` rescans the dir at `MOCK_RELOAD_POLL_MS` (default 30 s), full library reload |
+| `http_admin` | No background task — `POST /ghost/admin/reload` is the only trigger |
+
+`POST /ghost/admin/reload` is always live regardless of strategy.
+
+## Tenant model (v0.3, per-test isolation)
+
+Each `MockEntry` carries a `tenant: String` field defaulting to `_global`.
+The serving index key is `(method, uri, tenant)`, so a request under
+tenant `worker-3` cannot see entries written under any other tenant.
+
+Tenant resolution at request time, first-match wins:
+
+1. `X-Gostly-Tenant: <id>` request header
+2. `?_tenant=<id>` query string parameter (stripped before mock-library lookup so it doesn't corrupt the URI key)
+3. `_global` default
+
+Tenant strings are bounded at 128 chars to keep the metric label
+cardinality finite; longer values are truncated and reported via
+`ghost_tenant_truncated_total`.
+
+Use cases:
+
+- A single CI proxy serving 32 parallel pytest workers (each worker
+  tags its requests with a unique tenant header so they don't trample
+  each other's mocks).
+- Sharing a long-lived staging proxy across multiple feature branches.
+- Test fixtures that want stronger isolation than per-service routing
+  (because two tests on the same service can use different tenants).
+
+Backwards compatibility: pre-v0.3 JSONL files have no `tenant` field;
+serde's `default = "default_tenant"` makes them load as `_global`. The
+upgrade is wire-compatible with every existing recording.
+
 ## Going further
 
 This binary is the recording-and-replay core. AI gap-fill on traffic

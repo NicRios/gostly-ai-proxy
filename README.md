@@ -76,6 +76,42 @@ gostly mode learn   # flip back to recording
 - **MOCK** — replay from recorded library; falls back per config
 - **PASSTHROUGH** — pure pass-through (debugging)
 
+## Hot-reload
+
+Edit `data/mocks/*.jsonl` with a text editor; the proxy picks up the change without a restart. Pick a strategy with `MOCK_RELOAD_STRATEGY`:
+
+| Value        | When to use                                                                  |
+|--------------|------------------------------------------------------------------------------|
+| `fs_watch`   | Default. inotify (Linux) / FSEvents (macOS) / ReadDirectoryChangesW (Windows). 200 ms debounce coalesces editor-save bursts. |
+| `signal`     | k8s / Docker with shared volumes where filesystem events on bind-mounts or PVCs are flaky. `kubectl exec ... kill -HUP 1` triggers a reload. |
+| `poll`       | NFS / EFS / GCS-FUSE — anywhere fs events and SIGHUP are both unreliable. Interval defaults to 30 s; override with `MOCK_RELOAD_POLL_MS`. |
+| `http_admin` | Hosted / managed deployments. The route `POST /ghost/admin/reload` is always live regardless of strategy; this option just disables the background watcher. |
+
+In-flight safety: the proxy snapshots the live mock library at the top of every request and holds that snapshot until the request finishes. A reload mid-request publishes a *new* library; the in-flight handler keeps using the old one. New requests pick up the new library on their next snapshot.
+
+```bash
+# Edit the file …
+echo '{"id":"u1","timestamp":"2026-05-04T00:00:00Z","request":{"method":"GET","uri":"/users/1","body":""},"response":{"status":200,"headers":{},"body":"{\"v\":2}","latency_ms":0}}' \
+  > data/mocks/mock__global.jsonl
+
+# fs_watch picks it up automatically. To force a reload:
+curl -X POST http://localhost:8080/ghost/admin/reload
+```
+
+## Per-test isolation
+
+A single proxy can serve N parallel test workers without cross-pollution. Tag each worker's traffic with `X-Gostly-Tenant: <id>` (preferred) or `?_tenant=<id>` (fallback for clients that can't set headers). Mocks under tenant `worker-3` are invisible to requests under any other tenant. The default tenant is `_global`.
+
+```bash
+# Worker A records under tenant test-a
+curl -H "X-Gostly-Tenant: test-a" http://localhost:8080/api/users/1
+
+# Worker B records under tenant test-b — different mock, same endpoint
+curl -H "X-Gostly-Tenant: test-b" http://localhost:8080/api/users/1
+```
+
+Backwards compatible: pre-v0.3 JSONL files (no `tenant` field) load as `_global`. Existing recordings keep working.
+
 ## Sequences
 
 For testing retry logic, polling endpoints, or multi-step flows: define an ordered list of responses for a single endpoint. The cursor advances on each call.
