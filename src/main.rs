@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;
 use tower_http::trace::TraceLayer;
+use tower_http::limit::RequestBodyLimitLayer;
 use tracing::{info, warn, Level};
 
 mod matcher;
@@ -811,6 +812,13 @@ async fn run_proxy() {
         // ── Proxy (must be last) ──
         .fallback(any(proxy_handler))
         .with_state(state)
+        // Reject oversize request bodies BEFORE allocation. proxy_handler
+        // does ``body.collect().await.to_bytes()``, which buffers the full
+        // request body into memory — a 10GB inbound POST would otherwise
+        // produce a 10GB allocation before any in-handler check fires.
+        // RequestBodyLimitLayer streams + 413s at MAX_BODY_BYTES (default
+        // 1 MB). Override via the MAX_BODY_BYTES env var.
+        .layer(RequestBodyLimitLayer::new(max_body_bytes))
         .route_layer(prometheus_layer)
         .layer(TraceLayer::new_for_http().make_span_with(|req: &Request<Body>| {
             tracing::info_span!("ghost", method = %req.method(), uri = %req.uri())
@@ -1179,6 +1187,14 @@ fn clamp_tenant(raw: &str) -> String {
 
 // ─── Core proxy handler ───────────────────────────────────────────────────────
 
+#[tracing::instrument(
+    level = "info",
+    skip_all,
+    fields(
+        method = %req.method(),
+        uri = %req.uri(),
+    ),
+)]
 async fn proxy_handler(
     State(state): State<AppState>,
     req: Request,
