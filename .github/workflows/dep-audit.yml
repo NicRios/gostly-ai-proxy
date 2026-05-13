@@ -1,0 +1,57 @@
+name: dep-audit
+
+# Surfaces dependency advisories for the OSS proxy on every PR + daily on
+# main + manual dispatch. Advisory-only by design — `continue-on-error: true`
+# so the gate stays surface-only until the baseline is clean.
+#
+# Mirrors the cargo-audit step from spectre-ai's dep-audit.yml (PR #132),
+# stripped to the surfaces present in this repo (Rust only — no Python,
+# no JS, no Docker registry scanning here).
+
+on:
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/dep-audit.yml"
+  schedule:
+    # 13:17 UTC daily (off the hour to avoid GitHub scheduler congestion)
+    - cron: "17 13 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-audit:
+    name: cargo audit
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo-audit binary
+        id: cache-cargo-audit
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: cargo-audit-${{ runner.os }}-v1
+
+      - name: Install cargo-audit
+        if: steps.cache-cargo-audit.outputs.cache-hit != 'true'
+        run: cargo install --locked cargo-audit
+
+      - name: Run cargo audit
+        run: cargo audit --json | tee cargo-audit-report.json
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-audit-report
+          path: cargo-audit-report.json
+          retention-days: 30
