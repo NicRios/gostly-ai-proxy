@@ -8,7 +8,12 @@
 ARG CARGO_FEATURES=oss
 ARG GOSTLY_BUILD_COMMIT=dev
 
-FROM rust:1.88-slim AS builder
+# Base images digest-pinned 2026-05-13; refresh annually or on a published
+# advisory. Tag pins re-resolve on every `docker pull`, exposing every build
+# to registry-cache poisoning or maintainer-account-takeover republishing.
+# Verify with: `docker manifest inspect rust:1.88-slim`,
+# `docker buildx imagetools inspect gcr.io/distroless/cc-debian12:nonroot`.
+FROM rust:1.88-slim@sha256:38bc5a86d998772d4aec2348656ed21438d20fcdce2795b56ca434cf21430d89 AS builder
 ARG CARGO_FEATURES
 ARG GOSTLY_BUILD_COMMIT
 ENV GOSTLY_BUILD_COMMIT=${GOSTLY_BUILD_COMMIT}
@@ -37,7 +42,7 @@ RUN mkdir -p /pkg/app/data && chown -R 65532:65532 /pkg
 # than debian:bookworm-slim. Anything that needs to run inside the image
 # (eg. a healthcheck) must use the proxy's HTTP surface, not exec'd shell
 # commands.
-FROM gcr.io/distroless/cc-debian12:nonroot
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:e2d29aec8061843706b7e484c444f78fafb05bfe47745505252b1769a05d14f1
 COPY --from=builder /app/target/release/gostly-agent /usr/local/bin/gostly-proxy
 COPY --from=builder --chown=nonroot:nonroot /pkg/app /app
 
