@@ -181,6 +181,8 @@ impl TestProxyHarness {
             ],
             max_body_bytes: 1_000_000,
             traffic_log_dir: traffic_log_dir.clone(),
+            wide_events_dir: unique_tmp_dir("wide_events"),
+            observability_enabled: false,
             entry_counter: Arc::new(AtomicU64::new(0)),
             smart_swap_enabled,
             markov_state: Arc::new(parking_lot::RwLock::new(HashMap::new())),
@@ -259,6 +261,7 @@ impl TestProxyHarness {
             },
             service_id: service_id.map(str::to_string),
             tenant:     tenant.to_string(),
+            workload_class: default_workload_class(),
         };
         let current = self.state.mocks.load_full();
         let mut next: MockLibrary = (*current).clone();
@@ -754,6 +757,7 @@ async fn hot_reload_in_flight_request_uses_snapshotted_library() {
         },
         service_id: None,
         tenant:     GLOBAL_TENANT.to_string(),
+        workload_class: default_workload_class(),
     };
     {
         let current = h.state.mocks.load_full();
@@ -786,6 +790,7 @@ async fn hot_reload_in_flight_request_uses_snapshotted_library() {
         },
         service_id: None,
         tenant:     GLOBAL_TENANT.to_string(),
+        workload_class: default_workload_class(),
     };
     {
         let mut next = MockLibrary::new();

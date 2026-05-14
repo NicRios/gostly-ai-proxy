@@ -29,6 +29,12 @@ mod telemetry;
 mod resource_store;
 mod statechart;
 
+// Opt-in observability: User-Agent → workload class (human / ci / agent
+// / unknown) + flat wide-events JSONL log. Master switch is
+// `ENABLE_OBSERVABILITY=true`; default off.
+mod workload_class;
+mod wide_events;
+
 use chaos::ChaosConfig;
 
 // ─── Security floor ───────────────────────────────────────────────────────────
@@ -109,6 +115,15 @@ pub(crate) struct MockEntry {
     /// upgrade is wire-compatible.
     #[serde(default = "default_tenant")]
     pub tenant:     String,
+    /// Workload class inferred at record time. Defaults to `"unknown"`
+    /// when missing on disk (older JSONL lines lack the field). Value is
+    /// the lower-case wire form of [`workload_class::WorkloadClass`].
+    #[serde(default = "default_workload_class")]
+    pub workload_class: String,
+}
+
+pub(crate) fn default_workload_class() -> String {
+    workload_class::WorkloadClass::Unknown.as_str().to_string()
 }
 
 // ─── Sequence types ───────────────────────────────────────────────────────────
@@ -185,6 +200,16 @@ pub(crate) struct AppState {
     // Full history for training; never deduplicated.
     // See io::append_to_traffic_log for concurrency / SQLite upgrade notes.
     traffic_log_dir:         String,
+    // Wide-events JSONL log at `{wide_events_dir}/wide_events.jsonl`. One
+    // line per recorded request when observability is enabled. See
+    // wide_events.rs.
+    wide_events_dir:         String,
+    // Master switch for opt-in observability. When false: workload_class
+    // always falls back to "unknown" without inference, no wide-events
+    // JSONL is appended, and the workload-class Prometheus label collapses
+    // to a single value. Default off — operators flip
+    // `ENABLE_OBSERVABILITY=true` to opt in.
+    observability_enabled:   bool,
     // Monotonic counter for collision-free entry IDs at high concurrency.
     // timestamp_millis alone collides at ≥ 25 concurrent requests.
     entry_counter:           Arc<AtomicU64>,
@@ -665,6 +690,20 @@ async fn run_proxy() {
     let traffic_log_dir = std::env::var("TRAFFIC_LOG_DIR")
         .unwrap_or_else(|_| "data/traffic".to_string());
 
+    // Wide-events JSONL dir. One event per recorded request when
+    // ENABLE_OBSERVABILITY=true. See wide_events.rs.
+    let wide_events_dir = std::env::var("WIDE_EVENTS_DIR")
+        .unwrap_or_else(|_| "data/wide_events".to_string());
+    // Master switch — default off until operators opt in.
+    let observability_enabled = std::env::var("ENABLE_OBSERVABILITY")
+        .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1" | "yes" | "on"))
+        .unwrap_or(false);
+    if observability_enabled {
+        info!("observability_enabled");
+    } else {
+        info!("observability_disabled — set ENABLE_OBSERVABILITY=true to enable");
+    }
+
     let data_dir = std::path::Path::new(&mock_dir)
         .parent()
         .unwrap_or(std::path::Path::new("data"))
@@ -701,6 +740,7 @@ async fn run_proxy() {
     let _ = tokio::fs::create_dir_all(&data_dir).await;
     let _ = tokio::fs::create_dir_all(&mock_dir).await;
     let _ = tokio::fs::create_dir_all(&traffic_log_dir).await;
+    let _ = tokio::fs::create_dir_all(&wide_events_dir).await;
 
     // Load persisted mode
     let initial_mode = io::read_mode_from_file(&mode_file_path).await
@@ -797,6 +837,8 @@ async fn run_proxy() {
         redact_headers,
         max_body_bytes,
         traffic_log_dir,
+        wide_events_dir,
+        observability_enabled,
         entry_counter: Arc::new(AtomicU64::new(0)),
         smart_swap_enabled,
         markov_state: Arc::new(parking_lot::RwLock::new(HashMap::new())),
@@ -1328,6 +1370,23 @@ async fn proxy_handler(
     let body_str    = String::from_utf8_lossy(&bytes).to_string();
     let global_mode = state.mode.read().await.clone();
 
+    // ── Workload classification (opt-in observability) ───────────────────────
+    // Computed once per request so every downstream tag (JSONL line, log
+    // event, metric label, wide-event row) sees the same class. The
+    // classifier is a pure function of headers + UA — no global state.
+    // When the master switch is off, every request lands as `unknown` and
+    // the Prometheus label collapses to one value.
+    let ua_str: String = parts.headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let workload_label: &'static str = if state.observability_enabled {
+        workload_class::infer_workload_class(&parts.headers, &ua_str).as_str()
+    } else {
+        workload_class::WorkloadClass::Unknown.as_str()
+    };
+
     // ── Mock library snapshot (in-flight safety, v0.3 feature #6) ─────────────
     // Read the live library ONCE at the top of the handler. If a hot-reload
     // fires while this request is in flight, the watcher publishes a new
@@ -1779,10 +1838,41 @@ async fn proxy_handler(
                 // header land under `_global` so existing recordings stay
                 // readable to existing tests.
                 tenant: tenant.clone(),
+                workload_class: workload_label.to_string(),
             };
 
-            info!("📼 RECORDED {} {} → {} ({}ms)", method, path_query, res_status, latency_ms);
-            metrics::counter!("ghost_requests_total", "match_type" => "learn").increment(1);
+            info!(
+                operation = "request_recorded",
+                method = %method,
+                uri = %path_query,
+                status = res_status,
+                latency_ms = latency_ms,
+                workload_class = %workload_label,
+                service_id = ?resolved_service_id,
+                "request_recorded"
+            );
+            metrics::counter!(
+                "ghost_requests_total",
+                "match_type" => "learn",
+                "workload_class" => workload_label,
+            ).increment(1);
+
+            // ── Wide-event emission (best-effort, fire-and-forget) ────────────
+            // One event per recorded request. Attribute names match the
+            // OTEL `gen_ai` semconv so a future exporter is a passthrough.
+            // Gated by ENABLE_OBSERVABILITY=true.
+            if state.observability_enabled {
+                let we = wide_events::WideEvent::request_recorded(
+                    resolved_service_id.as_deref(),
+                    &method,
+                    &path_query,
+                    res_status,
+                    latency_ms,
+                    workload_label,
+                );
+                let we_dir = state.wide_events_dir.clone();
+                tokio::spawn(async move { wide_events::append(&we_dir, &we).await; });
+            }
 
             // Onboarding telemetry — first proxied request per service. The set is
             // process-local; the API enforces tenant-level idempotency.
