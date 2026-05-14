@@ -1100,6 +1100,90 @@ fn resolve_upstream(
     (default_url.to_string(), None, None, None, Vec::new())
 }
 
+// ─── Path helpers for resource-shaped routes ──────────────────────────────────
+//
+// Parse `/v1/charges/ch_abc` into ("charges", "ch_abc") and similar. Used by
+// the proxy hot path to detect resource-style GETs without spinning up a
+// router. Query strings are stripped before segment scanning.
+
+/// Parse `/collection/{id}` style paths. Returns `Some((collection, id))`
+/// when the path has at least two non-empty segments and the last segment is
+/// a plausible resource id (not a collection-level action like "search").
+fn parse_collection_and_id(path: &str) -> Option<(String, String)> {
+    /// Path segments that are commonly collection-level actions, not ids.
+    /// Conservative — false positives here mean we MISS a resource hit,
+    /// not that we corrupt one.
+    const NON_ID_SEGMENTS: &[&str] = &["search", "batch", "_count", "bulk", "query"];
+
+    let no_query = path.split('?').next().unwrap_or(path);
+    let segments: Vec<&str> = no_query
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    if segments.len() < 2 {
+        return None;
+    }
+    let id_seg = segments[segments.len() - 1];
+    let collection_seg = segments[segments.len() - 2];
+    if NON_ID_SEGMENTS.contains(&id_seg) {
+        return None;
+    }
+    // Reject api-version segments (`v1`, `v2`) as ids.
+    if id_seg.starts_with('v') && id_seg.len() <= 3 && id_seg[1..].chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some((collection_seg.to_string(), id_seg.to_string()))
+}
+
+/// Parse `/collection/{id}/{action}` style paths used for POST-style state
+/// transitions (e.g. `POST /charges/ch_abc/capture`). Returns
+/// `Some((collection, id, action))` when the path has at least three non-
+/// empty segments.
+fn parse_collection_id_action(path: &str) -> Option<(String, String, String)> {
+    let no_query = path.split('?').next().unwrap_or(path);
+    let segments: Vec<&str> = no_query
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    if segments.len() < 3 {
+        return None;
+    }
+    let action = segments[segments.len() - 1].to_string();
+    let id = segments[segments.len() - 2].to_string();
+    let collection = segments[segments.len() - 3].to_string();
+    Some((collection, id, action))
+}
+
+/// Return the trailing path segment when it looks like a collection name
+/// (no underscore-plus-digit id pattern, not a known action verb). Used by
+/// the LEARN-mode capture path: a POST to `/v1/charges` creates a resource;
+/// a POST to `/v1/charges/ch_abc/refund` is an action call (handled by the
+/// transition path, not this one).
+fn path_collection_segment(path: &str) -> Option<String> {
+    let no_query = path.split('?').next().unwrap_or(path);
+    let segments: Vec<&str> = no_query
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    let last = segments.last()?;
+    // If the last segment looks like an id (underscore + digits, common
+    // prefix-id style), this is NOT a collection path — skip.
+    if last.contains('_') && last.chars().any(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    // Reject if the last segment is a known action verb. Transitions are
+    // handled separately.
+    const ACTION_VERBS: &[&str] = &[
+        "capture", "refund", "void", "cancel", "activate", "pause",
+        "resume", "ship", "deliver", "return", "pay", "finalize",
+        "suspend", "reactivate", "delete",
+    ];
+    if ACTION_VERBS.contains(last) {
+        return None;
+    }
+    Some(last.to_string())
+}
+
 // ─── Onboarding milestones ────────────────────────────────────────────────────
 //
 // Increments a local telemetry counter once per service-id per process
@@ -1447,7 +1531,136 @@ async fn proxy_handler(
                 }
             }
 
-            // 3. Smart-swap fallback (opt-in via SMART_SWAP_ENABLED).
+            // 3. ResourceStore lookup.
+            //
+            // Catches the canonical "POST /charges → GET /charges/{id} → 404"
+            // failure mode: if a previous LEARN-mode POST captured a resource
+            // with this id, serve back the captured body as 200. Runs BEFORE
+            // smart-swap so an exact-id hit dominates a similar-looking
+            // structural miss.
+            if method == "GET" {
+                if let Some((collection, id)) = parse_collection_and_id(&path_query) {
+                    let svc_key = resolved_service_id.as_deref().unwrap_or(GLOBAL_TENANT);
+                    if let Some(resource) = state.resource_store
+                        .lookup(svc_key, &collection, &id).await
+                    {
+                        info!(
+                            collection = %collection,
+                            id = %id,
+                            "🔗 RESOURCE HIT {} {}", method, path_query,
+                        );
+                        metrics::counter!(
+                            "ghost_requests_total",
+                            "match_type" => "resource_store",
+                        ).increment(1);
+                        metrics::counter!(
+                            "gostly_resource_store_total",
+                            "operation" => "lookup",
+                            "outcome" => "hit",
+                        ).increment(1);
+                        fire_onboarding_event(
+                            &state,
+                            "first_mock_served",
+                            resolved_service_id.as_deref(),
+                            &state.onboarding_served,
+                        );
+                        let mut headers: HashMap<String, String> = HashMap::new();
+                        headers.insert(
+                            "Content-Type".to_string(),
+                            resource.content_type.clone(),
+                        );
+                        let body_bytes = serde_json::to_vec(&resource.body)
+                            .unwrap_or_default();
+                        // GET serves the captured body as 200 regardless of the
+                        // original response status — a captured 201 should
+                        // become 200 on read because GET is the read verb.
+                        return serve_mock_response(
+                            200,
+                            headers,
+                            body_bytes,
+                            0,
+                            "X-Ghost-Resource", "true",
+                        ).await;
+                    } else {
+                        metrics::counter!(
+                            "gostly_resource_store_total",
+                            "operation" => "lookup",
+                            "outcome" => "miss",
+                        ).increment(1);
+                    }
+                }
+            }
+
+            // 3a. Statechart transition.
+            //
+            // PATCH /collection/{id} with a JSON body containing an `action`
+            // field, OR POST /collection/{id}/{action}. Advances the bound
+            // statechart and serves the updated body.
+            if matches!(method.as_str(), "PATCH" | "POST") {
+                let svc_key = resolved_service_id.as_deref().unwrap_or(GLOBAL_TENANT);
+
+                // Form A: POST /collection/{id}/{action}
+                let transition_target = if method == "POST" {
+                    parse_collection_id_action(&path_query)
+                } else {
+                    None
+                };
+
+                // Form B: PATCH /collection/{id} with body {"action":"capture"}
+                let transition_from_body = if method == "PATCH" {
+                    parse_collection_and_id(&path_query).and_then(|(coll, id)| {
+                        let parsed: Option<serde_json::Value> = serde_json::from_str(&body_str).ok();
+                        let action = parsed.as_ref()
+                            .and_then(|v| v.get("action"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())?;
+                        Some((coll, id, action))
+                    })
+                } else {
+                    None
+                };
+
+                if let Some((collection, id, action)) = transition_target.or(transition_from_body) {
+                    if let Some(next_state) = state.resource_store
+                        .apply_transition(svc_key, &collection, &id, &action).await
+                    {
+                        info!(
+                            collection = %collection,
+                            id = %id,
+                            action = %action,
+                            next_state = %next_state,
+                            "🔁 RESOURCE TRANSITION {} {}", method, path_query,
+                        );
+                        metrics::counter!(
+                            "ghost_requests_total",
+                            "match_type" => "resource_transition",
+                        ).increment(1);
+                        if let Some(resource) = state.resource_store
+                            .lookup(svc_key, &collection, &id).await
+                        {
+                            let mut headers: HashMap<String, String> = HashMap::new();
+                            headers.insert(
+                                "Content-Type".to_string(),
+                                resource.content_type.clone(),
+                            );
+                            let body_bytes = serde_json::to_vec(&resource.body)
+                                .unwrap_or_default();
+                            // Transitions serve 200 — the captured original
+                            // status (often 201 for POST) is not appropriate
+                            // for the response to a state-change verb.
+                            return serve_mock_response(
+                                200,
+                                headers,
+                                body_bytes,
+                                0,
+                                "X-Ghost-Transition", &next_state,
+                            ).await;
+                        }
+                    }
+                }
+            }
+
+            // 4. Smart-swap fallback (opt-in via SMART_SWAP_ENABLED).
             //
             // Inference-assisted structural match and generative gap-fill
             // live in the hosted Gostly product (https://gostly.ai); they
@@ -1475,7 +1688,7 @@ async fn proxy_handler(
                 }
             }
 
-            // 4. Total miss
+            // 5. Total miss
             warn!("🔴 MOCK MISS {} {}", method, path_query);
             metrics::counter!("ghost_requests_total", "match_type" => "miss").increment(1);
             metrics::counter!("ghost_unmatched_total").increment(1);
@@ -1644,6 +1857,67 @@ async fn proxy_handler(
                 tokio::spawn(async move {
                     io::append_to_mock_log(&dir, &svc_id, &line).await;
                 });
+            }
+
+            // ── ResourceStore capture ────────────────────────────────────────
+            // POST/PUT to /collection that returns 2xx with a JSON body
+            // containing an id is a resource creation. Capture it so
+            // subsequent GET /collection/{id} serves back the original body
+            // instead of 404. Best-effort — failures are logged + counted,
+            // never unwind the LEARN-mode response.
+            if matches!(method.as_str(), "POST" | "PUT") && (200..300).contains(&res_status) {
+                if let Some(collection) = path_collection_segment(&path_query) {
+                    if let Ok(body_json) = serde_json::from_slice::<serde_json::Value>(&res_bytes) {
+                        let svc_key = resolved_service_id.as_deref()
+                            .unwrap_or(GLOBAL_TENANT).to_string();
+                        let content_type = res_headers
+                            .iter()
+                            .find(|(k, _)| k.to_lowercase() == "content-type")
+                            .map(|(_, v)| v.clone());
+                        let store = state.resource_store.clone();
+                        let collection_clone = collection.clone();
+                        let body_clone = body_json.clone();
+                        let svc_for_log = svc_key.clone();
+                        let coll_for_log = collection_clone.clone();
+                        // Spawn the capture so the LEARN response is not
+                        // blocked on disk persistence. The in-memory write
+                        // inside capture_create completes before the spawn
+                        // returns so a same-request GET would see it; the
+                        // JSONL append can race the wire response without
+                        // correctness impact.
+                        tokio::spawn(async move {
+                            match store.capture_create(
+                                &svc_key,
+                                &collection_clone,
+                                &body_clone,
+                                None,
+                                content_type.as_deref(),
+                                res_status,
+                            ).await {
+                                Ok(id) => {
+                                    info!(
+                                        operation = "resource_captured",
+                                        service_id = %svc_for_log,
+                                        collection = %coll_for_log,
+                                        id = %id,
+                                        "captured resource for stateful replay",
+                                    );
+                                }
+                                Err(e) => {
+                                    // IdNotFound is the common case for
+                                    // non-resource POSTs (login, search).
+                                    // Drop to debug so we don't flood the log.
+                                    tracing::debug!(
+                                        service_id = %svc_for_log,
+                                        collection = %coll_for_log,
+                                        error = %e,
+                                        "resource capture skipped",
+                                    );
+                                }
+                            }
+                        });
+                    }
+                }
             }
 
             build_response(res_status, &res_headers, res_bytes.to_vec())

@@ -187,6 +187,14 @@ impl TestProxyHarness {
             onboarding_proxied: Arc::new(parking_lot::RwLock::new(std::collections::HashSet::new())),
             onboarding_served:  Arc::new(parking_lot::RwLock::new(std::collections::HashSet::new())),
             telemetry,
+            resource_store: {
+                let statecharts = Arc::new(statechart::StatechartRegistry::with_bundled_fixtures());
+                Arc::new(resource_store::ResourceStore::new(
+                    data_dir.clone(),
+                    Some(statecharts),
+                ))
+            },
+            statecharts: Arc::new(statechart::StatechartRegistry::with_bundled_fixtures()),
         };
 
         let app = Router::new()
