@@ -224,25 +224,11 @@ impl TestProxyHarness {
         }
     }
 
-    /// Helper: insert a mock into the in-memory mocks map under the default
-    /// `_global` tenant. Tests that need a recorded fixture should call this
-    /// directly rather than going through LEARN mode.
+    /// Helper: insert a mock into the in-memory mocks map. Tests that need a
+    /// recorded fixture should call this directly rather than going through
+    /// LEARN mode.
     async fn add_mock(&self, service_id: Option<&str>, method: &str, uri: &str, status: u16, body: &str) {
-        self.add_mock_for_tenant(service_id, method, uri, status, body, GLOBAL_TENANT).await;
-    }
-
-    /// Tenant-aware fixture insertion. Used by per-tenant isolation tests
-    /// (v0.3, feature #7) to seed mocks under specific tenant keys.
-    async fn add_mock_for_tenant(
-        &self,
-        service_id: Option<&str>,
-        method: &str,
-        uri: &str,
-        status: u16,
-        body: &str,
-        tenant: &str,
-    ) {
-        let svc_key = service_id.unwrap_or(GLOBAL_TENANT).to_string();
+        let svc_key = service_id.unwrap_or(DEFAULT_SERVICE_ID).to_string();
         let entry = MockEntry {
             id:        "fixture-1".to_string(),
             timestamp: chrono::Utc::now().to_rfc3339(),
@@ -258,7 +244,6 @@ impl TestProxyHarness {
                 latency_ms: 0,
             },
             service_id: service_id.map(str::to_string),
-            tenant:     tenant.to_string(),
         };
         let current = self.state.mocks.load_full();
         let mut next: MockLibrary = (*current).clone();
@@ -268,7 +253,7 @@ impl TestProxyHarness {
         let mut seg_owned = (**segment).clone();
         let svc_map = seg_owned.services.entry(svc_key.clone()).or_default();
         svc_map.insert(
-            (method.to_string(), uri.to_string(), tenant.to_string()),
+            (method.to_string(), uri.to_string()),
             entry,
         );
         *segment = Arc::new(seg_owned);
@@ -395,8 +380,8 @@ async fn learn_records_mock_into_in_memory_index() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     let library = h.state.mocks.load_full();
     assert!(
-        library.find_exact("_global", "GET", "/api/learnable", "_global").is_some(),
-        "LEARN should record a mock under (_global service, _global tenant)"
+        library.find_exact("_global", "GET", "/api/learnable").is_some(),
+        "LEARN should record a mock under _global service"
     );
 
     h.cleanup();
@@ -653,34 +638,10 @@ async fn write_jsonl_mock(
     method: &str,
     uri: &str,
     body: &str,
-    tenant: &str,
 ) {
     let path = format!("{}/mock_{}.jsonl", dir, service);
-    // Produce the same shape MockEntry serializes to. `tenant` is the new
-    // v0.3 field; backwards-compat tests call `write_jsonl_mock_no_tenant`.
     let line = serde_json::to_string(&serde_json::json!({
         "id":         format!("fixture-{}-{}", method, uri),
-        "timestamp":  "2026-05-04T00:00:00Z",
-        "request":    {"method": method, "uri": uri, "body": ""},
-        "response":   {"status": 200, "headers": {}, "body": body, "latency_ms": 0},
-        "service_id": service,
-        "tenant":     tenant,
-    })).unwrap();
-    tokio::fs::write(&path, format!("{}\n", line)).await.unwrap();
-}
-
-/// Backwards-compat helper: writes a JSONL entry WITHOUT a tenant field —
-/// the shape pre-v0.3 files use. Loader must accept it as `_global`.
-async fn write_jsonl_mock_no_tenant(
-    dir: &str,
-    service: &str,
-    method: &str,
-    uri: &str,
-    body: &str,
-) {
-    let path = format!("{}/mock_{}.jsonl", dir, service);
-    let line = serde_json::to_string(&serde_json::json!({
-        "id":         format!("legacy-{}-{}", method, uri),
         "timestamp":  "2026-05-04T00:00:00Z",
         "request":    {"method": method, "uri": uri, "body": ""},
         "response":   {"status": 200, "headers": {}, "body": body, "latency_ms": 0},
@@ -708,7 +669,7 @@ async fn hot_reload_http_admin_picks_up_edits_without_restart() {
     let h = TestProxyHarness::with_mode(Mode::Mock).await;
 
     // v1: write the file, reload, fire a request.
-    write_jsonl_mock(&h.mock_dir, "_global", "GET", "/users/1", r#"{"version":1}"#, "_global").await;
+    write_jsonl_mock(&h.mock_dir, "_global", "GET", "/users/1", r#"{"version":1}"#).await;
     let client = reqwest::Client::new();
     let r = client.post(format!("{}/ghost/admin/reload", h.proxy_url)).send().await.unwrap();
     assert_eq!(r.status(), 200);
@@ -718,7 +679,7 @@ async fn hot_reload_http_admin_picks_up_edits_without_restart() {
     assert!(resp.text().await.unwrap().contains("\"version\":1"));
 
     // v2: rewrite the same file in-place, reload, fire again — must see the new body.
-    write_jsonl_mock(&h.mock_dir, "_global", "GET", "/users/1", r#"{"version":2}"#, "_global").await;
+    write_jsonl_mock(&h.mock_dir, "_global", "GET", "/users/1", r#"{"version":2}"#).await;
     let r = client.post(format!("{}/ghost/admin/reload", h.proxy_url)).send().await.unwrap();
     assert_eq!(r.status(), 200);
 
@@ -753,15 +714,14 @@ async fn hot_reload_in_flight_request_uses_snapshotted_library() {
             latency_ms: 250,
         },
         service_id: None,
-        tenant:     GLOBAL_TENANT.to_string(),
     };
     {
         let current = h.state.mocks.load_full();
         let mut next: MockLibrary = (*current).clone();
         let mut seg = MockSegment::default();
-        seg.services.entry(GLOBAL_TENANT.to_string()).or_default()
-            .insert(("GET".into(), "/snap".into(), GLOBAL_TENANT.into()), entry_v1);
-        next.segments.insert(GLOBAL_TENANT.to_string(), Arc::new(seg));
+        seg.services.entry(DEFAULT_SERVICE_ID.to_string()).or_default()
+            .insert(("GET".into(), "/snap".into()), entry_v1);
+        next.segments.insert(DEFAULT_SERVICE_ID.to_string(), Arc::new(seg));
         h.state.mocks.store(Arc::new(next));
     }
 
@@ -785,14 +745,13 @@ async fn hot_reload_in_flight_request_uses_snapshotted_library() {
             latency_ms: 0,
         },
         service_id: None,
-        tenant:     GLOBAL_TENANT.to_string(),
     };
     {
         let mut next = MockLibrary::new();
         let mut seg = MockSegment::default();
-        seg.services.entry(GLOBAL_TENANT.to_string()).or_default()
-            .insert(("GET".into(), "/snap".into(), GLOBAL_TENANT.into()), entry_v2);
-        next.segments.insert(GLOBAL_TENANT.to_string(), Arc::new(seg));
+        seg.services.entry(DEFAULT_SERVICE_ID.to_string()).or_default()
+            .insert(("GET".into(), "/snap".into()), entry_v2);
+        next.segments.insert(DEFAULT_SERVICE_ID.to_string(), Arc::new(seg));
         h.state.mocks.store(Arc::new(next));
     }
 
@@ -805,26 +764,6 @@ async fn hot_reload_in_flight_request_uses_snapshotted_library() {
     assert!(body2.contains("v2"),
         "post-reload request should see the new version, got: {}", body2);
 
-    h.cleanup();
-}
-
-/// Backwards-compat: a JSONL file with no `tenant` field at all
-/// (the pre-v0.3 shape) loads as `_global` and is matched by
-/// requests that also default to `_global` (no header).
-#[tokio::test]
-async fn hot_reload_backwards_compat_loads_pre_tenant_jsonl_as_global() {
-    let h = TestProxyHarness::with_mode(Mode::Mock).await;
-    // Use service_id `_global` so requests with no upstream route find it.
-    write_jsonl_mock_no_tenant(&h.mock_dir, "_global", "GET", "/legacy", r#"{"legacy":true}"#).await;
-    let client = reqwest::Client::new();
-    let r = client.post(format!("{}/ghost/admin/reload", h.proxy_url)).send().await.unwrap();
-    assert_eq!(r.status(), 200);
-
-    let resp = reqwest::get(format!("{}/legacy", h.proxy_url)).await.unwrap();
-    assert_eq!(resp.status(), 200);
-    let body = resp.text().await.unwrap();
-    assert!(body.contains("legacy"),
-        "pre-v0.3 JSONL must load and match under _global tenant, got: {}", body);
     h.cleanup();
 }
 
@@ -850,7 +789,7 @@ async fn hot_reload_fs_watch_picks_up_file_changes() {
     // before the watch is established and be missed.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-    write_jsonl_mock(&h.mock_dir, "_global", "GET", "/fswatch/1", r#"{"reloaded":true}"#, "_global").await;
+    write_jsonl_mock(&h.mock_dir, "_global", "GET", "/fswatch/1", r#"{"reloaded":true}"#).await;
 
     // Poll up to ~3s for the watcher to deliver the event and reload.
     let mut got_it = false;
@@ -888,7 +827,7 @@ async fn hot_reload_poll_strategy_reloads_on_interval() {
     // Write the mock AFTER starting the watcher so we know the poll loop
     // is the thing that picked it up (not initial-load).
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    write_jsonl_mock(&h.mock_dir, "_global", "GET", "/polled/1", r#"{"poll":"hit"}"#, "_global").await;
+    write_jsonl_mock(&h.mock_dir, "_global", "GET", "/polled/1", r#"{"poll":"hit"}"#).await;
 
     // Wait up to 2s for the next poll tick.
     let mut got_it = false;
@@ -918,7 +857,7 @@ async fn hot_reload_signal_strategy_reloads_on_sighup() {
     // Give signal-hook-tokio a moment to register the SIGHUP handler.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    write_jsonl_mock(&h.mock_dir, "_global", "GET", "/sighup/1", r#"{"sig":"hup"}"#, "_global").await;
+    write_jsonl_mock(&h.mock_dir, "_global", "GET", "/sighup/1", r#"{"sig":"hup"}"#).await;
 
     // Send SIGHUP to ourselves.
     // SAFETY: kill(2) is safe to call on any pid; SIGHUP is a standard
@@ -945,180 +884,3 @@ async fn hot_reload_signal_strategy_reloads_on_sighup() {
     h.cleanup();
 }
 
-// ─── v0.3 Per-tenant isolation tests (feature #7) ────────────────────────────
-//
-// `X-Gostly-Tenant` header (or `?_tenant=`) scopes the mock library so a
-// single proxy can serve N parallel test workers without cross-pollution.
-
-/// Three concurrent workers, each writing + reading mocks under their own
-/// tenant header. None of them sees the others' mocks.
-#[tokio::test]
-async fn per_tenant_three_concurrent_workers_zero_cross_pollution() {
-    let h = TestProxyHarness::with_mode(Mode::Mock).await;
-    // Seed a different response per tenant against the same (method, uri).
-    h.add_mock_for_tenant(None, "GET", "/x", 200, r#"{"who":"alice"}"#, "alice").await;
-    h.add_mock_for_tenant(None, "GET", "/x", 200, r#"{"who":"bob"}"#,   "bob").await;
-    h.add_mock_for_tenant(None, "GET", "/x", 200, r#"{"who":"carol"}"#, "carol").await;
-
-    let client = reqwest::Client::new();
-
-    // Fire three concurrent requests, each tagged with a different tenant
-    // header. Each must see ITS tenant's body, never another's.
-    let url = format!("{}/x", h.proxy_url);
-    let (a, b, c) = tokio::join!(
-        client.get(&url).header("X-Gostly-Tenant", "alice").send(),
-        client.get(&url).header("X-Gostly-Tenant", "bob").send(),
-        client.get(&url).header("X-Gostly-Tenant", "carol").send(),
-    );
-    let a_body = a.unwrap().text().await.unwrap();
-    let b_body = b.unwrap().text().await.unwrap();
-    let c_body = c.unwrap().text().await.unwrap();
-    assert!(a_body.contains("alice"), "tenant alice saw: {}", a_body);
-    assert!(b_body.contains("bob"),   "tenant bob saw: {}",   b_body);
-    assert!(c_body.contains("carol"), "tenant carol saw: {}", c_body);
-
-    // And a request with NO tenant header / query → falls into _global.
-    // _global has no /x mock, so the response is 404 (not "alice", not "bob",
-    // not "carol"). This proves no implicit fallback is happening.
-    let untagged = reqwest::get(format!("{}/x", h.proxy_url)).await.unwrap();
-    assert_eq!(untagged.status(), 404,
-        "untagged request must fall into _global (which has no /x mock), not borrow another tenant's");
-
-    h.cleanup();
-}
-
-/// `?_tenant=foo` query parameter is honoured as a fallback for clients
-/// that can't set headers.
-#[tokio::test]
-async fn per_tenant_query_string_fallback() {
-    let h = TestProxyHarness::with_mode(Mode::Mock).await;
-    h.add_mock_for_tenant(None, "GET", "/qs", 200, r#"{"via":"qs"}"#, "via-qs").await;
-
-    let resp = reqwest::get(format!("{}/qs?_tenant=via-qs", h.proxy_url)).await.unwrap();
-    assert_eq!(resp.status(), 200);
-    let body = resp.text().await.unwrap();
-    assert!(body.contains("\"via\":\"qs\""), "query-string tenant lookup failed: {}", body);
-    h.cleanup();
-}
-
-/// The header is preferred over the query string when both are present.
-#[tokio::test]
-async fn per_tenant_header_wins_over_query_string() {
-    let h = TestProxyHarness::with_mode(Mode::Mock).await;
-    h.add_mock_for_tenant(None, "GET", "/p", 200, r#"{"via":"header"}"#, "from-header").await;
-    h.add_mock_for_tenant(None, "GET", "/p", 200, r#"{"via":"query"}"#,  "from-query").await;
-
-    let client = reqwest::Client::new();
-    let resp = client.get(format!("{}/p?_tenant=from-query", h.proxy_url))
-        .header("X-Gostly-Tenant", "from-header")
-        .send().await.unwrap();
-    assert_eq!(resp.status(), 200);
-    let body = resp.text().await.unwrap();
-    assert!(body.contains("header"), "header should override query string, got: {}", body);
-    assert!(!body.contains("query"));
-    h.cleanup();
-}
-
-/// LEARN mode records mocks under the request's tenant; the recorded mock
-/// is then visible only to subsequent requests under the same tenant.
-#[tokio::test]
-async fn per_tenant_learn_records_under_request_tenant() {
-    let h = TestProxyHarness::new().await; // LEARN by default
-    h.upstream.set_body(r#"{"recorded":"under-test-1"}"#);
-    let client = reqwest::Client::new();
-
-    // Record under tenant test-1.
-    let _ = client.get(format!("{}/recorded", h.proxy_url))
-        .header("X-Gostly-Tenant", "test-1")
-        .send().await.unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-    // Flip to MOCK mode and verify the recorded mock is tenant-scoped.
-    *h.state.mode.write().await = Mode::Mock;
-
-    // Same tenant → hit.
-    let r1 = client.get(format!("{}/recorded", h.proxy_url))
-        .header("X-Gostly-Tenant", "test-1")
-        .send().await.unwrap();
-    assert_eq!(r1.status(), 200);
-    assert!(r1.text().await.unwrap().contains("under-test-1"));
-
-    // Different tenant → miss (404).
-    let r2 = client.get(format!("{}/recorded", h.proxy_url))
-        .header("X-Gostly-Tenant", "test-2")
-        .send().await.unwrap();
-    assert_eq!(r2.status(), 404,
-        "tenant test-2 must not see test-1's recorded mock");
-
-    h.cleanup();
-}
-
-/// `POST /ghost/mocks` accepts an explicit `tenant` field; missing field
-/// defaults to `_global` for backwards compatibility.
-#[tokio::test]
-async fn per_tenant_admin_post_accepts_tenant_field_and_defaults_to_global() {
-    let h = TestProxyHarness::with_mode(Mode::Mock).await;
-    let client = reqwest::Client::new();
-
-    // POST a mock under a custom tenant.
-    let body = serde_json::json!({
-        "id":         "admin-1",
-        "timestamp":  "2026-05-04T00:00:00Z",
-        "request":    {"method": "GET", "uri": "/admin", "body": ""},
-        "response":   {"status": 200, "headers": {}, "body": "{\"who\":\"admin-tenant\"}", "latency_ms": 0},
-        "tenant":     "admin-tenant"
-    });
-    let r = client.post(format!("{}/ghost/mocks", h.proxy_url))
-        .json(&body)
-        .send().await.unwrap();
-    assert_eq!(r.status(), 200);
-
-    // Read back under the same tenant.
-    let resp = client.get(format!("{}/admin", h.proxy_url))
-        .header("X-Gostly-Tenant", "admin-tenant")
-        .send().await.unwrap();
-    assert_eq!(resp.status(), 200);
-    assert!(resp.text().await.unwrap().contains("admin-tenant"));
-
-    // POST a second mock with NO tenant field → defaults to _global.
-    let body_default = serde_json::json!({
-        "id":         "admin-2",
-        "timestamp":  "2026-05-04T00:00:00Z",
-        "request":    {"method": "GET", "uri": "/admin-default", "body": ""},
-        "response":   {"status": 200, "headers": {}, "body": "{\"who\":\"global\"}", "latency_ms": 0}
-    });
-    let r2 = client.post(format!("{}/ghost/mocks", h.proxy_url))
-        .json(&body_default)
-        .send().await.unwrap();
-    assert_eq!(r2.status(), 200);
-
-    // Read back under no tenant → _global.
-    let resp_default = reqwest::get(format!("{}/admin-default", h.proxy_url)).await.unwrap();
-    assert_eq!(resp_default.status(), 200);
-    assert!(resp_default.text().await.unwrap().contains("global"));
-
-    h.cleanup();
-}
-
-/// `GET /ghost/mocks?tenant=foo` returns only entries under that tenant.
-#[tokio::test]
-async fn per_tenant_list_mocks_supports_tenant_filter() {
-    let h = TestProxyHarness::with_mode(Mode::Mock).await;
-    h.add_mock_for_tenant(None, "GET", "/a", 200, "a-body", "tenant-a").await;
-    h.add_mock_for_tenant(None, "GET", "/b", 200, "b-body", "tenant-b").await;
-
-    let scoped = reqwest::get(format!("{}/ghost/mocks?tenant=tenant-a", h.proxy_url))
-        .await.unwrap()
-        .text().await.unwrap();
-    assert!(scoped.contains("a-body"), "tenant-a list missing its own mock: {}", scoped);
-    assert!(!scoped.contains("b-body"),
-        "tenant-a list must not contain tenant-b's mock: {}", scoped);
-
-    let all = reqwest::get(format!("{}/ghost/mocks", h.proxy_url))
-        .await.unwrap()
-        .text().await.unwrap();
-    assert!(all.contains("a-body") && all.contains("b-body"),
-        "unfiltered list should show both tenants: {}", all);
-
-    h.cleanup();
-}

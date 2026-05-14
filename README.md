@@ -98,20 +98,6 @@ echo '{"id":"u1","timestamp":"2026-05-04T00:00:00Z","request":{"method":"GET","u
 curl -X POST http://localhost:8080/ghost/admin/reload
 ```
 
-## Per-test isolation
-
-A single proxy can serve N parallel test workers without cross-pollution. Tag each worker's traffic with `X-Gostly-Tenant: <id>` (preferred) or `?_tenant=<id>` (fallback for clients that can't set headers). Mocks under tenant `worker-3` are invisible to requests under any other tenant. The default tenant is `_global`.
-
-```bash
-# Worker A records under tenant test-a
-curl -H "X-Gostly-Tenant: test-a" http://localhost:8080/api/users/1
-
-# Worker B records under tenant test-b — different mock, same endpoint
-curl -H "X-Gostly-Tenant: test-b" http://localhost:8080/api/users/1
-```
-
-Backwards compatible: pre-v0.3 JSONL files (no `tenant` field) load as `_global`. Existing recordings keep working.
-
 ## Sequences
 
 For testing retry logic, polling endpoints, or multi-step flows: define an ordered list of responses for a single endpoint. The cursor advances on each call.

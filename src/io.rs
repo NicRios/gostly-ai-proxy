@@ -1,21 +1,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use crate::{MockEntry, MockSequence, Mode, GLOBAL_TENANT};
+use crate::{MockEntry, MockSequence, Mode, DEFAULT_SERVICE_ID};
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 
-/// Tenant key for per-test isolation (v0.3, feature #7). Backwards-compat
-/// JSONL files without a tenant field deserialize to `_global`. Requests
-/// without `X-Gostly-Tenant` (or `?_tenant=`) read `_global`.
-pub type Tenant = String;
-
-/// Per-service mock map: (method, uri, tenant) → MockEntry. O(1) exact lookup.
-///
-/// Tenant scoping (v0.3, feature #7) is part of the key so a single library
-/// can hold mocks for many parallel test workers without cross-pollination.
-/// A request under tenant `worker-3` will only ever match entries written
-/// under tenant `worker-3`; the default tenant is `_global`.
-pub type ServiceMocks = HashMap<(String, String, Tenant), MockEntry>;
+/// Per-service mock map: (method, uri) → MockEntry. O(1) exact lookup.
+pub type ServiceMocks = HashMap<(String, String), MockEntry>;
 
 /// One mock file → one immutable `MockSegment`. Hot-reload (v0.3, feature #6)
 /// rebuilds only the changed file's segment, leaving the others untouched, so
@@ -72,19 +62,16 @@ impl MockLibrary {
         svcs.len()
     }
 
-    /// Look up a single (method, uri, tenant) entry across all segments.
+    /// Look up a single (method, uri) entry across all segments.
     /// Returns the first matching `MockEntry` found in any segment that
-    /// contains the requested service_id. The `_global` tenant fallback is
-    /// the responsibility of the caller (handler) — this function is
-    /// strictly tenant-scoped so accidental cross-pollution is impossible.
+    /// contains the requested service_id.
     pub fn find_exact(
         &self,
         service_id: &str,
         method: &str,
         uri: &str,
-        tenant: &str,
     ) -> Option<MockEntry> {
-        let key = (method.to_string(), uri.to_string(), tenant.to_string());
+        let key = (method.to_string(), uri.to_string());
         for seg in self.segments.values() {
             if let Some(svc) = seg.services.get(service_id) {
                 if let Some(entry) = svc.get(&key) {
@@ -95,37 +82,27 @@ impl MockLibrary {
         None
     }
 
-    /// Collect every entry for `service_id` across every segment, optionally
-    /// filtered by tenant. Used by smart-swap fallback which needs the full
-    /// per-service corpus.
-    pub fn entries_for_service(
-        &self,
-        service_id: &str,
-        tenant: Option<&str>,
-    ) -> Vec<MockEntry> {
+    /// Collect every entry for `service_id` across every segment. Used by
+    /// smart-swap fallback which needs the full per-service corpus.
+    pub fn entries_for_service(&self, service_id: &str) -> Vec<MockEntry> {
         let mut out = Vec::new();
         for seg in self.segments.values() {
             if let Some(svc) = seg.services.get(service_id) {
-                for ((_, _, t), e) in svc.iter() {
-                    if tenant.is_none_or(|want| want == t) {
-                        out.push(e.clone());
-                    }
+                for e in svc.values() {
+                    out.push(e.clone());
                 }
             }
         }
         out
     }
 
-    /// Flatten every entry across every segment (used by `GET /ghost/mocks`,
-    /// optionally tenant-scoped).
-    pub fn all_entries(&self, tenant: Option<&str>) -> Vec<MockEntry> {
+    /// Flatten every entry across every segment (used by `GET /ghost/mocks`).
+    pub fn all_entries(&self) -> Vec<MockEntry> {
         let mut out = Vec::new();
         for seg in self.segments.values() {
             for svc in seg.services.values() {
-                for ((_, _, t), e) in svc.iter() {
-                    if tenant.is_none_or(|want| want == t) {
-                        out.push(e.clone());
-                    }
+                for e in svc.values() {
+                    out.push(e.clone());
                 }
             }
         }
@@ -152,10 +129,8 @@ async fn load_one_segment(path: &std::path::Path) -> Option<(String, MockSegment
     let mut svc_mocks: ServiceMocks = HashMap::new();
     for line in content.lines() {
         if let Ok(entry) = serde_json::from_str::<MockEntry>(line) {
-            // Tenant defaults to "_global" when missing on disk (serde default).
-            let tenant = entry.tenant.clone();
             svc_mocks.insert(
-                (entry.request.method.clone(), entry.request.uri.clone(), tenant),
+                (entry.request.method.clone(), entry.request.uri.clone()),
                 entry,
             );
         }
@@ -164,7 +139,7 @@ async fn load_one_segment(path: &std::path::Path) -> Option<(String, MockSegment
         return None;
     }
 
-    // Compact: rewrite file with one line per unique (method, uri, tenant) so
+    // Compact: rewrite file with one line per unique (method, uri) so
     // the append log doesn't grow unboundedly between restarts.
     let tmp = format!("{}.tmp", path.display());
     let compacted = svc_mocks.values()
@@ -216,17 +191,16 @@ pub async fn reload_segment(path: &std::path::Path) -> Option<(String, Arc<MockS
 pub fn library_from_entries(entries: Vec<MockEntry>) -> MockLibrary {
     let mut svc_map: HashMap<String, ServiceMocks> = HashMap::new();
     for entry in entries {
-        let svc = entry.service_id.clone().unwrap_or_else(|| GLOBAL_TENANT.to_string());
+        let svc = entry.service_id.clone().unwrap_or_else(|| DEFAULT_SERVICE_ID.to_string());
         let key = (
             entry.request.method.clone(),
             entry.request.uri.clone(),
-            entry.tenant.clone(),
         );
         svc_map.entry(svc).or_default().insert(key, entry);
     }
     let mut library = MockLibrary::new();
     library.segments.insert(
-        GLOBAL_TENANT.to_string(),
+        DEFAULT_SERVICE_ID.to_string(),
         Arc::new(MockSegment { services: svc_map }),
     );
     library
@@ -641,7 +615,7 @@ mod tests {
     //
     // The library is a tree of `Arc<MockSegment>` keyed by file basename.
     // Each segment contains a `services: HashMap<String, ServiceMocks>` —
-    // ServiceMocks is keyed by (method, uri, tenant). The tests below assert
+    // ServiceMocks is keyed by (method, uri). The tests below assert
     // both load behaviour AND segment shape so future refactors don't
     // silently flatten the tree.
 
@@ -680,7 +654,7 @@ mod tests {
         assert_eq!(lib.segments.len(), 1, "exactly one segment expected, got {:?}", lib.segments.keys().collect::<Vec<_>>());
         let seg = segment_for(&lib, "svc-a").expect("svc-a segment missing");
         let svc = seg.services.get("svc-a").expect("svc-a service map missing");
-        assert!(svc.contains_key(&("GET".to_string(), "/users".to_string(), GLOBAL_TENANT.to_string())));
+        assert!(svc.contains_key(&("GET".to_string(), "/users".to_string())));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -690,7 +664,7 @@ mod tests {
         // Two entries for the same (GET, /users); HashMap keeps one. The exact
         // winner is implementation-defined since serde_json::from_str + collect
         // doesn't guarantee order — the load contract is "exactly one entry
-        // per (method, uri, tenant)" which is what we assert.
+        // per (method, uri)" which is what we assert.
         let body = format!(
             "{}\n{}\n",
             entry_line("first", "GET", "/users"),
@@ -703,7 +677,7 @@ mod tests {
         let svc = seg.services.get("svc").expect("svc service map missing");
         assert_eq!(
             svc.len(), 1,
-            "duplicates must collapse to a single entry per (method, uri, tenant)"
+            "duplicates must collapse to a single entry per (method, uri)"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -789,7 +763,7 @@ mod tests {
     #[tokio::test]
     async fn append_to_traffic_log_writes_per_service_files() {
         // Different service_ids produce different files — important for the
-        // multi-tenant traffic capture path.
+        // per-service traffic capture path.
         let dir = unique_dir("multisvc");
         append_to_traffic_log(&dir, "svc-a", r#"{"a":1}"#).await;
         append_to_traffic_log(&dir, "svc-b", r#"{"b":1}"#).await;

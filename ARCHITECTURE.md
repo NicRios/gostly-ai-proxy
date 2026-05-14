@@ -145,35 +145,6 @@ panics from a writer that shrinks the index out from under a reader.
 
 `POST /ghost/admin/reload` is always live regardless of strategy.
 
-## Tenant model (v0.3, per-test isolation)
-
-Each `MockEntry` carries a `tenant: String` field defaulting to `_global`.
-The serving index key is `(method, uri, tenant)`, so a request under
-tenant `worker-3` cannot see entries written under any other tenant.
-
-Tenant resolution at request time, first-match wins:
-
-1. `X-Gostly-Tenant: <id>` request header
-2. `?_tenant=<id>` query string parameter (stripped before mock-library lookup so it doesn't corrupt the URI key)
-3. `_global` default
-
-Tenant strings are bounded at 128 chars to keep the metric label
-cardinality finite; longer values are truncated and reported via
-`ghost_tenant_truncated_total`.
-
-Use cases:
-
-- A single CI proxy serving 32 parallel pytest workers (each worker
-  tags its requests with a unique tenant header so they don't trample
-  each other's mocks).
-- Sharing a long-lived staging proxy across multiple feature branches.
-- Test fixtures that want stronger isolation than per-service routing
-  (because two tests on the same service can use different tenants).
-
-Backwards compatibility: pre-v0.3 JSONL files have no `tenant` field;
-serde's `default = "default_tenant"` makes them load as `_global`. The
-upgrade is wire-compatible with every existing recording.
-
 ## Going further
 
 This binary is the recording-and-replay core. AI gap-fill on traffic
