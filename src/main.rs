@@ -65,8 +65,9 @@ enum Mode { Learn, Mock, Passthrough, Transitioning }
 // plus an opt-in smart-swap fallback (enable with `SMART_SWAP_ENABLED=true`).
 //
 // Inference-assisted structural match, generative gap-fill, and the
-// multi-user dashboard / MCP server live in the hosted Gostly product
-// (https://gostly.ai). They are not part of this codebase; nothing here
+// multi-user dashboard / MCP server ship in the full Gostly product
+// (https://gostly.ai) — a richer self-hosted Docker stack, not a
+// managed service. They are not part of this codebase; nothing here
 // gates against them.
 
 // ─── Mock library types ───────────────────────────────────────────────────────
@@ -822,9 +823,9 @@ async fn run_proxy() {
         .route("/ghost/mocks",     get(handle_list_mocks).post(handle_create_mock))
         .route("/ghost/reload",    post(handle_reload_mocks))
         // v0.3 hot-reload (feature #6) — explicit operator-driven reload
-        // for hosted/managed deployments where neither fs events nor SIGHUP
-        // is appropriate (`MOCK_RELOAD_STRATEGY=http_admin`). The route is
-        // always live regardless of the configured strategy.
+        // for Kubernetes / containerized deployments where neither fs
+        // events nor SIGHUP is reliable (`MOCK_RELOAD_STRATEGY=http_admin`).
+        // The route is always live regardless of the configured strategy.
         .route("/ghost/admin/reload", post(handle_admin_reload))
         .route("/ghost/unmatched", get(handle_list_unmatched))
         // ── Sequence admin (v0.2.0+) ────────────────────────────────────
@@ -977,11 +978,12 @@ async fn handle_create_mock(
     }))
 }
 
-/// `POST /ghost/admin/reload` — explicit hot-reload trigger for hosted /
-/// managed deployments where neither fs events nor SIGHUP fit (v0.3,
-/// feature #6, `MOCK_RELOAD_STRATEGY=http_admin`). The route is always live
-/// regardless of the configured strategy so operators can force a reload
-/// even when a background watcher is also running.
+/// `POST /ghost/admin/reload` — explicit hot-reload trigger for
+/// Kubernetes / containerized deployments where neither fs events nor
+/// SIGHUP fit (v0.3, feature #6, `MOCK_RELOAD_STRATEGY=http_admin`).
+/// The route is always live regardless of the configured strategy so
+/// operators can force a reload even when a background watcher is also
+/// running.
 async fn handle_admin_reload(State(state): State<AppState>) -> Json<serde_json::Value> {
     let (count, services) = io::reload_full(&state.mock_dir, &state.mocks).await;
     metrics::counter!("ghost_mock_reloads_total", "trigger" => "http_admin").increment(1);
@@ -1663,8 +1665,8 @@ async fn proxy_handler(
             // 4. Smart-swap fallback (opt-in via SMART_SWAP_ENABLED).
             //
             // Inference-assisted structural match and generative gap-fill
-            // live in the hosted Gostly product (https://gostly.ai); they
-            // are not part of this binary.
+            // ship in the full Gostly product (https://gostly.ai); they are
+            // not part of this binary.
             //
             // Smart-swap is also tenant-scoped: only entries written under
             // the resolved tenant are candidates.

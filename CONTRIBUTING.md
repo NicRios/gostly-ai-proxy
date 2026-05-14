@@ -6,7 +6,7 @@ Thanks for your interest. Read this first — it'll save you time.
 
 The proxy is intentionally narrow: record, replay, smart-swap, OpenAPI/Postman/HAR import, basic chaos primitives, single-binary distribution. **That's the v1 scope and it is frozen** through the v0.1 release (target: Sat May 23 2026).
 
-Larger surface area — AI gap-fill, multi-user dashboards, drift detection, team features — lives in the hosted product at [gostly.ai](https://gostly.ai). PRs that add those features to this repo will be closed with a pointer to the hosted roadmap.
+Larger surface area — AI gap-fill, multi-user dashboards, drift detection, team features — ships in the full Gostly product at [gostly.ai](https://gostly.ai). The full product is a richer self-hosted Docker stack; nothing is run by us. PRs that add those features to this repo will be closed with a pointer to the full-product roadmap.
 
 This freeze exists so a single maintainer can keep up with reviews. It will be revisited after v1 ships.
 
@@ -20,7 +20,7 @@ Bug reports are very welcome. A good report includes:
 - What you expected vs. what happened
 - Minimal repro (a curl command + the upstream URL pattern is usually enough)
 
-Feature requests: open an issue tagged `proposal`. If it fits the v1 scope, great. If it's hosted-product-shaped, expect a redirect to gostly.ai. Either response is fine — don't take it personally.
+Feature requests: open an issue tagged `proposal`. If it fits the v1 scope, great. If it belongs in the full Gostly product, expect a redirect to gostly.ai. Either response is fine — don't take it personally.
 
 ## Pull requests
 

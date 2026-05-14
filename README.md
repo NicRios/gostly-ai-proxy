@@ -85,7 +85,7 @@ Edit `data/mocks/*.jsonl` with a text editor; the proxy picks up the change with
 | `fs_watch`   | Default. inotify (Linux) / FSEvents (macOS) / ReadDirectoryChangesW (Windows). 200 ms debounce coalesces editor-save bursts. |
 | `signal`     | k8s / Docker with shared volumes where filesystem events on bind-mounts or PVCs are flaky. `kubectl exec ... kill -HUP 1` triggers a reload. |
 | `poll`       | NFS / EFS / GCS-FUSE — anywhere fs events and SIGHUP are both unreliable. Interval defaults to 30 s; override with `MOCK_RELOAD_POLL_MS`. |
-| `http_admin` | Hosted / managed deployments. The route `POST /ghost/admin/reload` is always live regardless of strategy; this option just disables the background watcher. |
+| `http_admin` | Kubernetes / containerized deployments where filesystem events and signals are both impractical. The route `POST /ghost/admin/reload` is always live regardless of strategy; this option just disables the background watcher. |
 
 In-flight safety: the proxy snapshots the live mock library at the top of every request and holds that snapshot until the request finishes. A reload mid-request publishes a *new* library; the in-flight handler keeps using the old one. New requests pick up the new library on their next snapshot.
 
@@ -169,8 +169,9 @@ Three modes per service. Mock library is plain JSONL — diffable, version-contr
 
 This repo is the recording proxy itself. AI gap-fill on traffic you've
 recorded, a multi-user dashboard, drift detection, and team features
-(SAML / RBAC / audit) live in the hosted Gostly product —
-<https://gostly.ai>.
+(SAML / RBAC / audit) ship in the full Gostly product —
+<https://gostly.ai>. It's a richer Docker stack you self-host the same
+way as this binary; nothing is run by us.
 
 The binary in this repo runs entirely on your machine.
 
@@ -184,10 +185,10 @@ FSL-1.1-Apache-2.0. See [LICENSE.md](LICENSE.md). After 2 years from each releas
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). v1 scope is frozen — issue reports and bug-fix PRs welcome; larger features go to the hosted product at <https://gostly.ai>.
+See [CONTRIBUTING.md](CONTRIBUTING.md). v1 scope is frozen — issue reports and bug-fix PRs welcome; larger features go to the full product at <https://gostly.ai>.
 
 ## Links
 
-- Hosted product: https://gostly.ai
+- Full product: https://gostly.ai
 - Issues: https://github.com/NicRios/gostly-ai-proxy/issues
 - Architecture deep dive: [ARCHITECTURE.md](ARCHITECTURE.md)
