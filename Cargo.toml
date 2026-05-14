@@ -55,3 +55,16 @@ futures = "0.3"
 # is required for the #[derive(Parser)] / #[derive(Subcommand)] macros and
 # `env` lets `--upstream` fall back to the BACKEND_URL env var.
 clap = { version = "4", features = ["derive", "env"] }
+
+# Typed errors for resource_store. anyhow stays at the application boundary.
+thiserror = "1"
+
+# ── Benchmarks ────────────────────────────────────────────────────────────────
+
+[[bench]]
+name = "resource_store_lookup_bench"
+harness = false
+
+[[bench]]
+name = "resource_store_stress_bench"
+harness = false

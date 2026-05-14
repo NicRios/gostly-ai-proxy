@@ -1,0 +1,37 @@
+{
+  "id": "invoice",
+  "initial": "draft",
+  "status_field": "status",
+  "states": {
+    "draft": {
+      "transitions": {
+        "finalize": "open",
+        "void": "voided"
+      }
+    },
+    "open": {
+      "transitions": {
+        "pay": "paid",
+        "void": "voided",
+        "uncollectible": "uncollectible"
+      }
+    },
+    "paid": {
+      "transitions": {
+        "refund": "refunded"
+      }
+    },
+    "refunded": {
+      "transitions": {}
+    },
+    "voided": {
+      "transitions": {}
+    },
+    "uncollectible": {
+      "transitions": {
+        "pay": "paid",
+        "void": "voided"
+      }
+    }
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "id": "charge",
+  "initial": "created",
+  "status_field": "status",
+  "states": {
+    "created": {
+      "transitions": {
+        "capture": "captured",
+        "void": "voided"
+      }
+    },
+    "captured": {
+      "transitions": {
+        "refund": "refunded"
+      }
+    },
+    "refunded": {
+      "transitions": {}
+    },
+    "voided": {
+      "transitions": {}
+    }
+  }
+}

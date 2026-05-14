@@ -1,0 +1,22 @@
+{
+  "id": "customer",
+  "initial": "active",
+  "status_field": "status",
+  "states": {
+    "active": {
+      "transitions": {
+        "suspend": "suspended",
+        "delete": "deleted"
+      }
+    },
+    "suspended": {
+      "transitions": {
+        "reactivate": "active",
+        "delete": "deleted"
+      }
+    },
+    "deleted": {
+      "transitions": {}
+    }
+  }
+}
