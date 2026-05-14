@@ -43,11 +43,10 @@ parking_lot = "0.12"
 notify = "6.1"
 arc-swap = "1"
 
-# SIGHUP-driven reload (v0.3) — tokio-friendly stream of POSIX signals.
-# Optional path: `MOCK_RELOAD_STRATEGY=signal` for k8s/Docker setups where
-# fs events on shared volumes are unreliable.
-signal-hook = "0.3"
-signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"] }
+# SIGHUP-driven reload (v0.3) — Unix-only; see the
+# `[target.'cfg(unix)'.dependencies]` block below for `signal-hook` +
+# `signal-hook-tokio`. `futures` is used in the unix watcher task and is
+# fine cross-platform.
 futures = "0.3"
 
 # CLI parser. The default `gostly` invocation with no subcommand boots the
@@ -58,6 +57,17 @@ clap = { version = "4", features = ["derive", "env"] }
 
 # Typed errors for resource_store. anyhow stays at the application boundary.
 thiserror = "1"
+
+# ── Platform-conditional dependencies ─────────────────────────────────────────
+
+# `signal-hook-tokio` pulls in `tokio::net::UnixStream` and gates its
+# `iterator` module on `cfg(not(windows))`. SIGHUP is a Unix-only concept
+# anyway — `MOCK_RELOAD_STRATEGY=signal` is documented as Unix-only, and
+# `src/io.rs::spawn_signal_watch` is `cfg(not(unix))`-stubbed to a warn
+# log so Windows users still get fs_watch / poll / http_admin reload.
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.3"
+signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"] }
 
 # ── Benchmarks ────────────────────────────────────────────────────────────────
 
