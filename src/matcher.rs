@@ -375,6 +375,7 @@ mod tests {
             timestamp: "2024-01-01T00:00:00Z".to_string(),
             service_id: None,
             tenant: crate::GLOBAL_TENANT.to_string(),
+            workload_class: crate::default_workload_class(),
             request: MockRequest {
                 method: method.to_string(),
                 uri: uri.to_string(),
@@ -700,6 +701,7 @@ mod tests_alpha {
             timestamp: "2024-01-01T00:00:00Z".to_string(),
             service_id: None,
             tenant: crate::GLOBAL_TENANT.to_string(),
+            workload_class: crate::default_workload_class(),
             request: MockRequest {
                 method: method.to_string(),
                 uri: uri.to_string(),

@@ -98,6 +98,18 @@ echo '{"id":"u1","timestamp":"2026-05-04T00:00:00Z","request":{"method":"GET","u
 curl -X POST http://localhost:8080/ghost/admin/reload
 ```
 
+## Observability (opt-in)
+
+Set `ENABLE_OBSERVABILITY=true` to turn on workload-class tagging + a wide-events log.
+
+- Every recorded request gets a `workload_class` field: `human`, `ci`, `agent`, or `unknown`. The classifier is a pure function of the User-Agent + headers (no I/O). Browser UAs → `human`. GitHub Actions / Jenkins / CircleCI / 8 other runners → `ci`. Claude Code / Cursor / Copilot / Anthropic SDK / 10 other agent UAs → `agent`. Curl / wget / python-requests / anything else → `unknown`.
+- A second JSONL log at `data/wide_events/wide_events.jsonl` (override with `WIDE_EVENTS_DIR`) gets one flat event per recorded request. Attribute names follow the OTEL [`gen_ai` semconv](https://opentelemetry.io/docs/specs/semconv/gen-ai/) so a future OTEL exporter is a passthrough.
+- The Prometheus counter `ghost_requests_total` gains a `workload_class` label.
+
+Default off because the classifier rule list is still maturing against real customer traffic and the wide-events log is opt-in customer data. When off: every request lands as `unknown`, no wide-events JSONL is written, and the Prometheus label collapses to one value.
+
+Explicit override: set request header `x-gostly-workload-class: agent` to force classification (only the `agent` value is honored — see `src/workload_class.rs` for rationale).
+
 ## Per-test isolation
 
 A single proxy can serve N parallel test workers without cross-pollution. Tag each worker's traffic with `X-Gostly-Tenant: <id>` (preferred) or `?_tenant=<id>` (fallback for clients that can't set headers). Mocks under tenant `worker-3` are invisible to requests under any other tenant. The default tenant is `_global`.
