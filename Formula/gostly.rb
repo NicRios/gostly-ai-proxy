@@ -18,28 +18,28 @@
 class Gostly < Formula
   desc "OSS recording proxy — record, mock, replay HTTP traffic"
   homepage "https://gostly.ai"
-  version "0.2.0"
+  version "0.3.0"
   license "FSL-1.1-Apache-2.0"
 
   on_macos do
     on_arm do
-      url "https://github.com/NicRios/gostly-ai-proxy/releases/download/v0.2.0/gostly-proxy-darwin-arm64.tar.gz"
-      sha256 "bdd1a0d64b50387b73e180468cc57251ea7a88a49fe437755a6f5f894fa79270"
+      url "https://github.com/NicRios/gostly-ai-proxy/releases/download/v0.3.0/gostly-proxy-darwin-arm64.tar.gz"
+      sha256 "a8eedfbb13214601bdaddf89ba7e82befc1d252eb490b21ca7093f3183a39055"
     end
     on_intel do
-      url "https://github.com/NicRios/gostly-ai-proxy/releases/download/v0.2.0/gostly-proxy-darwin-amd64.tar.gz"
-      sha256 "5dea3dfae3f783627af688b123d0fa4d52fbfde577cee6090b337e648aa58371"
+      url "https://github.com/NicRios/gostly-ai-proxy/releases/download/v0.3.0/gostly-proxy-darwin-amd64.tar.gz"
+      sha256 "68f3f7c1cb6cd9fa62051d3df69c090472e8ce4fe1996643776c8f6ae8e24c6d"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/NicRios/gostly-ai-proxy/releases/download/v0.2.0/gostly-proxy-linux-arm64.tar.gz"
-      sha256 "e2ecc368f422b7fa572707f0ebb27e7009df4fec63a2e1847cca07d0207e61f5"
+      url "https://github.com/NicRios/gostly-ai-proxy/releases/download/v0.3.0/gostly-proxy-linux-arm64.tar.gz"
+      sha256 "16846e5c2be2ec4b7b2fd5043ac42a92f41eba9c8c39dfd28988f198eb439efa"
     end
     on_intel do
-      url "https://github.com/NicRios/gostly-ai-proxy/releases/download/v0.2.0/gostly-proxy-linux-amd64.tar.gz"
-      sha256 "85bbf941d95ee84105f9b3b8522eb37e6e8c352ef3aed5477671fe1a6748226f"
+      url "https://github.com/NicRios/gostly-ai-proxy/releases/download/v0.3.0/gostly-proxy-linux-amd64.tar.gz"
+      sha256 "237294f147068897d871252e0cb34b558fb9b6a34c478d05b2582e298e38adae"
     end
   end
 
