@@ -7,7 +7,8 @@ This repository is licensed under FSL-1.1-Apache-2.0:
 - See LICENSE.md for full terms.
 
 The proxy code in this repository is OSS. Larger product surface (AI
-inference, dashboard, training, drift detection, multi-user features) is
-available in the hosted Gostly product at <https://gostly.ai>.
+inference, dashboard, training, drift detection, multi-user features)
+ships in the full Gostly product at <https://gostly.ai> — a richer
+self-hosted Docker stack, not a managed service.
 
 Questions: hello@gostly.ai

@@ -179,5 +179,7 @@ upgrade is wire-compatible with every existing recording.
 This binary is the recording-and-replay core. AI gap-fill on traffic
 you've already recorded (per-service LoRA adapters, RAG-grounded
 generation), a multi-user dashboard, drift detection, training
-pipelines, scrubbed managed storage, and team features (SAML / RBAC /
-audit) live in the hosted Gostly product at <https://gostly.ai>.
+pipelines, scrubbed storage, and team features (SAML / RBAC / audit)
+ship in the full Gostly product at <https://gostly.ai>. The full
+product is a richer Docker stack the customer self-hosts the same
+way — nothing is run by us.
