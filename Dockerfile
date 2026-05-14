@@ -24,6 +24,14 @@ RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/li
 # Cache dependency layer.
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs
+# Stub the bench files Cargo.toml declares. Auto-discovery requires the
+# paths to exist or the manifest fails to parse — but we don't want to
+# COPY the real ./benches here because changes to bench code would bust
+# the dep-cache layer for no benefit (benches aren't built in this
+# image).
+RUN mkdir benches \
+    && echo "fn main() {}" > benches/resource_store_lookup_bench.rs \
+    && echo "fn main() {}" > benches/resource_store_stress_bench.rs
 RUN cargo build --release --no-default-features --features "${CARGO_FEATURES}"
 RUN rm src/main.rs
 
