@@ -24,6 +24,11 @@ mod chaos;
 mod markov_chaos;
 mod telemetry;
 
+// Linked Mocks — ResourceStore + statechart interpreter for stateful
+// request flows. POST captures, GET serves, PATCH advances state.
+mod resource_store;
+mod statechart;
+
 use chaos::ChaosConfig;
 
 // ─── Security floor ───────────────────────────────────────────────────────────
@@ -203,6 +208,15 @@ pub(crate) struct AppState {
     /// In-memory telemetry collector backing the local `/metrics`
     /// endpoint. Nothing is shipped off-box.
     telemetry:               telemetry::TelemetryCollector,
+    /// Captured resources for stateful POST → GET → PATCH replay flows.
+    /// See `resource_store.rs` for the persistence + statechart-binding
+    /// contract.
+    pub(crate) resource_store: Arc<resource_store::ResourceStore>,
+    /// Bundled statechart registry. Held on AppState so the resource
+    /// store and proxy handler can both look up machines without
+    /// rebuilding the registry on every request.
+    #[allow(dead_code)]
+    pub(crate) statecharts:   Arc<statechart::StatechartRegistry>,
 }
 
 // ─── JSON schemas for handlers ────────────────────────────────────────────────
@@ -753,6 +767,19 @@ async fn run_proxy() {
         .build()
         .expect("failed to build HTTP client");
 
+    // Linked Mocks: build the statechart registry from the bundled fixtures,
+    // then hand it to the resource store so PATCH-style transitions can
+    // mutate captured bodies' status fields. The store also replays any
+    // prior captures from data/resources/{service_id}.jsonl on boot.
+    let statecharts = Arc::new(statechart::StatechartRegistry::with_bundled_fixtures());
+    info!(statecharts_loaded = statecharts.len(), "statechart registry initialised");
+    let resource_store = Arc::new(resource_store::ResourceStore::new(
+        data_dir.clone(),
+        Some(statecharts.clone()),
+    ));
+    resource_store.load_from_disk().await;
+    info!(resources_replayed = resource_store.len().await, "resource store loaded from disk");
+
     let state = AppState {
         http_client,
         mode:                    Arc::new(RwLock::new(initial_mode)),
@@ -775,6 +802,8 @@ async fn run_proxy() {
         onboarding_proxied: Arc::new(parking_lot::RwLock::new(std::collections::HashSet::new())),
         onboarding_served:  Arc::new(parking_lot::RwLock::new(std::collections::HashSet::new())),
         telemetry:          telemetry_collector.clone(),
+        resource_store:     resource_store.clone(),
+        statecharts:        statecharts.clone(),
     };
 
     let _ = (&data_dir, &telemetry_collector);

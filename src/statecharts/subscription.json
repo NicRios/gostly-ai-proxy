@@ -1,0 +1,28 @@
+{
+  "id": "subscription",
+  "initial": "trialing",
+  "status_field": "status",
+  "states": {
+    "trialing": {
+      "transitions": {
+        "activate": "active",
+        "cancel": "cancelled"
+      }
+    },
+    "active": {
+      "transitions": {
+        "pause": "paused",
+        "cancel": "cancelled"
+      }
+    },
+    "paused": {
+      "transitions": {
+        "resume": "active",
+        "cancel": "cancelled"
+      }
+    },
+    "cancelled": {
+      "transitions": {}
+    }
+  }
+}

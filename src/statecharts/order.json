@@ -1,0 +1,41 @@
+{
+  "id": "order",
+  "initial": "pending",
+  "status_field": "status",
+  "states": {
+    "pending": {
+      "transitions": {
+        "pay": "paid",
+        "cancel": "cancelled"
+      }
+    },
+    "paid": {
+      "transitions": {
+        "ship": "shipped",
+        "refund": "refunded"
+      }
+    },
+    "shipped": {
+      "transitions": {
+        "deliver": "delivered",
+        "return": "returned"
+      }
+    },
+    "delivered": {
+      "transitions": {
+        "return": "returned"
+      }
+    },
+    "returned": {
+      "transitions": {
+        "refund": "refunded"
+      }
+    },
+    "refunded": {
+      "transitions": {}
+    },
+    "cancelled": {
+      "transitions": {}
+    }
+  }
+}
